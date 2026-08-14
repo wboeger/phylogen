@@ -184,6 +184,33 @@ input:focus, textarea:focus, select:focus {
 .mode-panel { display: none; }
 .mode-panel.active { display: block; }
 
+.fragment-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
+.fragment-check {
+  display: flex; gap: 9px; align-items: flex-start;
+  font-weight: 400; font-size: 0.85rem; color: var(--body);
+  padding: 11px 12px; border: 1px solid var(--hairline); border-radius: var(--radius-md);
+  cursor: pointer; margin: 0; background: var(--canvas);
+  transition: border-color .15s, background .15s;
+}
+.fragment-check:has(input:checked) { border-color: var(--primary); background: var(--surface-card); }
+.fragment-check input { width: auto; margin-top: 2px; }
+
+.custom-fragment-row { padding: 16px; margin-top: 10px; }
+.custom-fragment-row .field { margin-bottom: 10px; }
+
+.review-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin: 10px 0; }
+.review-table th { text-align: left; font-weight: 600; color: var(--muted); font-size: 0.72rem;
+  text-transform: uppercase; letter-spacing: 0.04em; padding: 6px 10px; border-bottom: 1px solid var(--hairline); }
+.review-table td { padding: 6px 10px; border-bottom: 1px solid var(--hairline-soft); }
+.review-table tr:last-child td { border-bottom: none; }
+.review-table .missing-row td { color: var(--error); }
+
+.model-badge {
+  display: inline-block; font-family: var(--font-mono); font-size: 0.74rem;
+  background: var(--surface-cream-strong); color: var(--body-strong);
+  padding: 2px 9px; border-radius: var(--radius-pill); margin: 2px 4px 2px 0;
+}
+
 button, .btn {
   font-family: var(--font-sans);
   font-size: 0.88rem;
@@ -232,6 +259,62 @@ button:disabled { background: var(--primary-disabled); color: var(--muted); curs
 /* ── Job detail ──────────────────────────────────────────────────────────── */
 .status-line { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .status-message { color: var(--muted); font-size: 0.9rem; }
+
+/* ── Stage bar (conspicuous run progress) ───────────────────────────────── */
+.run-status-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 4px; }
+
+.elapsed-timer {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-family: var(--font-mono); font-size: 0.8rem; font-weight: 600;
+  color: var(--primary-active); background: var(--surface-card);
+  padding: 4px 12px; border-radius: var(--radius-pill);
+  white-space: nowrap;
+}
+.elapsed-timer .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--primary); animation: blink-dot 1.1s ease-in-out infinite; }
+@keyframes blink-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
+
+.badge.is-running { animation: badge-pulse 1.6s ease-in-out infinite; }
+@keyframes badge-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(161, 117, 31, 0.35); }
+  50% { box-shadow: 0 0 0 5px rgba(161, 117, 31, 0); }
+}
+
+.stage-bar { display: flex; align-items: flex-start; margin: 18px 0 6px; }
+.stage-step { display: flex; flex-direction: column; align-items: center; flex: 1; position: relative; }
+.stage-step .stage-line {
+  position: absolute; top: 11px; left: -50%; width: 100%; height: 2px;
+  background: var(--hairline); z-index: 0;
+}
+.stage-step:first-child .stage-line { display: none; }
+.stage-dot {
+  width: 24px; height: 24px; border-radius: 50%;
+  background: var(--canvas); border: 2px solid var(--hairline);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700; color: var(--muted-soft);
+  z-index: 1; transition: background .2s, border-color .2s, box-shadow .2s, color .2s;
+}
+.stage-label { font-size: 0.72rem; margin-top: 7px; color: var(--muted); text-align: center; max-width: 120px; line-height: 1.3; }
+
+.stage-step.done .stage-dot { background: var(--primary); border-color: var(--primary); color: #fff; }
+.stage-step.done .stage-line { background: var(--primary); }
+.stage-step.done .stage-label { color: var(--body-strong); }
+
+.stage-step.active .stage-dot {
+  border-color: var(--primary); color: var(--primary-active);
+  animation: stage-pulse 1.4s ease-in-out infinite;
+}
+.stage-step.active .stage-label { color: var(--ink); font-weight: 600; }
+@keyframes stage-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(204, 120, 92, 0.35); }
+  50% { box-shadow: 0 0 0 7px rgba(204, 120, 92, 0); }
+}
+
+.stage-step.warn .stage-dot { border-color: var(--warning); color: var(--warning); }
+.stage-step.warn .stage-label { color: var(--warning); }
+
+.stage-step.error .stage-dot { background: var(--error); border-color: var(--error); color: #fff; }
+.stage-step.error .stage-line { background: var(--error); }
+.stage-step.error .stage-label { color: var(--error); font-weight: 600; }
 
 .tree-panel { background: var(--canvas); border: 1px solid var(--hairline); border-radius: var(--radius-lg); padding: 16px; overflow-x: auto; }
 .tree-panel svg { display: block; }

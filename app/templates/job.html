@@ -8,16 +8,22 @@
   <div class="status-line">
     <h2 style="margin:0;">
       {% if job.input_mode == 'taxon' %}{{ job.taxon_query }}{% else %}Manual species list{% endif %}
-      &mdash; {{ job.marker }}
+      &mdash; {{ job.fragments|map(attribute='code')|join(' + ') }}
     </h2>
     <span class="badge status-{{ job.status }}" id="status-badge">{{ job.status.replace('_', ' ') }}</span>
   </div>
-  <p class="status-message" id="status-message">{{ job.status_message or '' }}</p>
+  <div class="run-status-row">
+    <p class="status-message" id="status-message" style="margin:0;">{{ job.status_message or '' }}</p>
+    <span class="elapsed-timer" id="main-timer" style="display:none;"><span class="live-dot"></span><span id="main-timer-text">0:00</span></span>
+  </div>
+  <div class="stage-bar" id="main-stage-bar"></div>
+  <div id="fragment-models" style="margin-top:6px;"></div>
 
-  <ul class="file-list mono" style="font-size:0.8rem; color: var(--muted);">
+  <ul class="file-list mono" style="font-size:0.8rem; color: var(--muted); margin-top:10px;">
     <li>job id: {{ job.id }}</li>
-    <li>NCBI query: {{ job.gene_query }}</li>
-    <li>min length: {{ job.min_length }} bp</li>
+    {% for frag in job.fragments %}
+    <li>{{ frag.code }}: {{ frag.query }} (min {{ frag.min_length }} bp)</li>
+    {% endfor %}
     {% if job.outgroup_text %}<li>outgroup: {{ job.outgroup_text.replace('\n', ', ') }}</li>{% endif %}
   </ul>
 
@@ -27,6 +33,19 @@
     <button class="btn-danger" onclick="deleteJob()">Delete job</button>
     {% endif %}
   </div>
+</div>
+
+<div class="card on-canvas" id="review-card" style="{{ '' if job.status == 'fetched' else 'display:none;' }}">
+  <h3>Review fetched sequences</h3>
+  <p class="hint">Check what was found per fragment before spending Galaxy time aligning it.</p>
+  <div id="review-body"></div>
+  <form onsubmit="return submitApprove(event)" style="margin-top:16px; display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap;">
+    <div class="field" style="flex:1; min-width:260px; margin:0;">
+      <label for="approve-galaxy-key">usegalaxy.eu API key (leave blank to reuse the one from the form)</label>
+      <input type="password" id="approve-galaxy-key" placeholder="optional — reuses your original key" autocomplete="off">
+    </div>
+    <button type="submit" class="btn-primary">Approve &amp; align</button>
+  </form>
 </div>
 
 <div class="card on-canvas" id="nj-card" style="{{ '' if job.nj_newick else 'display:none;' }}">
@@ -42,9 +61,20 @@
   </form>
 </div>
 
+<div class="card on-canvas" id="confirm-card" style="display:none;">
+  <h3>Confirm sequences included in this tree</h3>
+  <p class="hint">One row per taxon in the concatenated alignment, and which fragment(s) it contributed.</p>
+  <div id="confirm-body"></div>
+  <button type="button" class="btn-primary" style="margin-top:12px;" onclick="confirmNj()">Confirm &amp; enable ML tree build</button>
+</div>
+
 <div class="card on-canvas" id="ml-card" style="{{ '' if job.ml_status else 'display:none;' }}">
   <h3>Maximum-Likelihood tree (RAxML-NG, bootstrap support)</h3>
-  <p class="status-message" id="ml-message">{{ job.ml_message or '' }}</p>
+  <div class="run-status-row">
+    <p class="status-message" id="ml-message" style="margin:0;">{{ job.ml_message or '' }}</p>
+    <span class="elapsed-timer" id="ml-timer" style="display:none;"><span class="live-dot"></span><span id="ml-timer-text">0:00</span></span>
+  </div>
+  <div class="stage-bar" id="ml-stage-bar"></div>
   <div class="tree-panel" id="ml-tree-panel" style="{{ '' if job.ml_newick else 'display:none;' }}">
     <svg id="ml-svg"></svg>
   </div>
@@ -57,23 +87,28 @@
   </form>
 </div>
 
-<div class="card on-canvas" id="build-ml-card" style="{{ 'display:none;' if job.ml_status else '' }}">
+<div class="card on-canvas" id="build-ml-card" style="display:none;">
   <h3>Build a bootstrapped ML tree</h3>
-  <p>Submits the trimmed alignment to usegalaxy.eu for a RAxML-NG run (ML search + bootstrap support). This can take from minutes to a few hours depending on alignment size and Galaxy queue load.</p>
+  <p>Submits the concatenated, partitioned alignment to usegalaxy.eu for a RAxML-NG run (ML search + bootstrap support, per-fragment models). This can take from minutes to a few hours depending on alignment size and Galaxy queue load.</p>
   <form onsubmit="return submitBuildMl(event)" style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap;" id="build-ml-form">
     <div class="field" style="flex:1; min-width:260px; margin:0;">
       <label for="ml-galaxy-key">usegalaxy.eu API key</label>
       <input type="password" id="ml-galaxy-key" placeholder="re-enter your Galaxy API key" autocomplete="off">
     </div>
-    <button type="submit" class="btn-primary" {{ 'disabled' if not job.trimmed_fasta_path }}>Build ML tree</button>
+    <button type="submit" class="btn-primary">Build ML tree</button>
   </form>
-  {% if not job.trimmed_fasta_path %}<p class="hint">Waiting for alignment/trimming to finish first.</p>{% endif %}
 </div>
 
 <script src="{{ url_for('static', filename='js/tree.js') }}"></script>
 <script>
 const JOB_ID = {{ job.id | tojson }};
+const JOB_CREATED_AT = {{ job.created_at_iso | tojson }};
+const MAIN_STAGES = ['Fetch sequences', 'Review & approve', 'Align & trim', 'Build NJ tree'];
+const ML_STAGES = ['Submit & run on Galaxy', 'Done'];
 let polling = null;
+let mainTimerHandle = null;
+let mlTimerHandle = null;
+let lastData = null;
 
 function renderIfPresent(id, newick) {
   if (!newick) return;
@@ -81,10 +116,124 @@ function renderIfPresent(id, newick) {
   requestAnimationFrame(() => renderPhylogram(newick, svg));
 }
 
+function renderStageBar(elId, stages, index, state) {
+  const el = document.getElementById(elId);
+  el.innerHTML = '';
+  stages.forEach((label, i) => {
+    const step = document.createElement('div');
+    step.className = 'stage-step';
+    if (i < index) {
+      step.classList.add('done');
+    } else if (i === index) {
+      step.classList.add(state === 'done' ? 'done' : state);
+    }
+    const line = document.createElement('div');
+    line.className = 'stage-line';
+    step.appendChild(line);
+    const dot = document.createElement('div');
+    dot.className = 'stage-dot';
+    const isDone = i < index || (i === index && state === 'done');
+    dot.textContent = isDone ? '\u2713' : (i === index && state === 'error' ? '!' : String(i + 1));
+    step.appendChild(dot);
+    const lbl = document.createElement('div');
+    lbl.className = 'stage-label';
+    lbl.textContent = label;
+    step.appendChild(lbl);
+    el.appendChild(step);
+  });
+}
+
+function formatElapsed(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), s = total % 60;
+  const mm = h ? String(m).padStart(2, '0') : String(m);
+  const ss = String(s).padStart(2, '0');
+  return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+function startTimer(wrapId, textId, startIso, handleSetter, handleGetter) {
+  const existing = handleGetter();
+  if (existing) clearInterval(existing);
+  const start = new Date(startIso).getTime();
+  const wrap = document.getElementById(wrapId);
+  const text = document.getElementById(textId);
+  wrap.style.display = 'inline-flex';
+  const tick = () => { text.textContent = formatElapsed(Date.now() - start); };
+  tick();
+  handleSetter(setInterval(tick, 1000));
+}
+
+function stopTimer(handleGetter, handleSetter) {
+  const h = handleGetter();
+  if (h) { clearInterval(h); handleSetter(null); }
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function renderReview(fetchResults) {
+  const body = document.getElementById('review-body');
+  if (!fetchResults) { body.innerHTML = ''; return; }
+  let html = '';
+  for (const [code, r] of Object.entries(fetchResults)) {
+    html += `<h4 style="margin:14px 0 4px;">${escapeHtml(code)} <span class="hint" style="font-weight:400;">(${r.n_sequences} sequence(s))</span></h4>`;
+    if (r.found && r.found.length) {
+      html += '<table class="review-table"><thead><tr><th>Species</th><th>Accession</th><th>Length</th></tr></thead><tbody>';
+      for (const row of r.found) {
+        html += `<tr><td><em>${escapeHtml(row.species)}</em></td><td class="mono">${escapeHtml(row.accession)}</td><td>${row.length} bp</td></tr>`;
+      }
+      html += '</tbody></table>';
+    }
+    const missing = (r.missing || []).concat(r.outgroup_missing || []);
+    if (missing.length) {
+      html += `<table class="review-table"><tbody><tr class="missing-row"><td>Not found:</td><td colspan="2">${escapeHtml(missing.join(', '))}</td></tr></tbody></table>`;
+    }
+  }
+  body.innerHTML = html;
+}
+
+function renderConfirm(coverage) {
+  const body = document.getElementById('confirm-body');
+  if (!coverage || !Object.keys(coverage).length) { body.innerHTML = ''; return; }
+  let html = '<table class="review-table"><thead><tr><th>Species</th><th>Fragments included</th></tr></thead><tbody>';
+  for (const [sp, cov] of Object.entries(coverage).sort()) {
+    html += `<tr><td><em>${escapeHtml(sp)}</em></td><td>${escapeHtml(cov)}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  body.innerHTML = html;
+}
+
+function renderFragmentModels(models, counts) {
+  const el = document.getElementById('fragment-models');
+  if (!models || !Object.keys(models).length) { el.innerHTML = ''; return; }
+  el.innerHTML = Object.entries(models).map(([code, model]) => {
+    const n = (counts && counts[code]) ? ` \u00b7 ${counts[code]} seq` : '';
+    return `<span class="model-badge">${escapeHtml(code)}: ${escapeHtml(model)}${n}</span>`;
+  }).join('');
+}
+
 function applyStatus(data) {
-  document.getElementById('status-badge').textContent = data.status.replace('_', ' ');
-  document.getElementById('status-badge').className = 'badge status-' + data.status;
+  lastData = data;
+  const badge = document.getElementById('status-badge');
+  badge.textContent = data.status.replace('_', ' ');
+  badge.className = 'badge status-' + data.status;
   document.getElementById('status-message').textContent = data.status_message || data.error_message || '';
+
+  const mainRunning = data.stage_state === 'active';
+  badge.classList.toggle('is-running', mainRunning);
+  renderStageBar('main-stage-bar', MAIN_STAGES, data.stage_index, data.stage_state);
+  if (mainRunning) {
+    startTimer('main-timer', 'main-timer-text', JOB_CREATED_AT,
+               v => mainTimerHandle = v, () => mainTimerHandle);
+  } else {
+    stopTimer(() => mainTimerHandle, v => mainTimerHandle = v);
+  }
+
+  renderFragmentModels(data.fragment_models, data.fragment_counts);
+
+  document.getElementById('review-card').style.display = (data.status === 'fetched') ? '' : 'none';
+  if (data.status === 'fetched') renderReview(data.fetch_results);
 
   if (data.nj_newick) {
     document.getElementById('nj-card').style.display = '';
@@ -92,10 +241,26 @@ function applyStatus(data) {
     renderIfPresent('nj-svg', data.nj_newick);
   }
 
+  const njDone = ['nj_ready', 'trimmed'].includes(data.status);
+  document.getElementById('confirm-card').style.display = (njDone && !data.nj_confirmed) ? '' : 'none';
+  if (njDone && !data.nj_confirmed) renderConfirm(data.species_coverage);
+  document.getElementById('build-ml-card').style.display = (data.nj_confirmed && !data.ml_status) ? '' : 'none';
+
   if (data.ml_status) {
     document.getElementById('ml-card').style.display = '';
     document.getElementById('build-ml-card').style.display = 'none';
     document.getElementById('ml-message').textContent = data.ml_message || '';
+    const mlRunning = data.ml_status === 'running';
+    const mlIndex = mlRunning ? 0 : 1;
+    const mlState = data.ml_status === 'error' ? 'error' : (mlRunning ? 'active' : 'done');
+    renderStageBar('ml-stage-bar', ML_STAGES, mlIndex, mlState);
+    document.getElementById('ml-timer').classList.toggle('is-running', mlRunning);
+    if (mlRunning && data.ml_started_at) {
+      startTimer('ml-timer', 'ml-timer-text', data.ml_started_at,
+                 v => mlTimerHandle = v, () => mlTimerHandle);
+    } else {
+      stopTimer(() => mlTimerHandle, v => mlTimerHandle = v);
+    }
     if (data.ml_newick) {
       document.getElementById('ml-tree-panel').style.display = '';
       document.getElementById('ml-reroot-form').style.display = 'flex';
@@ -118,9 +283,33 @@ async function pollStatus() {
 
 // Render whatever the server already rendered, then poll if still in-flight.
 applyStatus({{ job.to_status_dict() | tojson }});
-{% if job.status in ('created', 'fetching', 'aligning', 'nj_running') or job.ml_status == 'running' %}
+{% if job.status in ('created', 'fetching', 'fetched', 'aligning', 'nj_running') or job.ml_status == 'running' %}
 polling = setInterval(pollStatus, 3000);
 {% endif %}
+
+async function submitApprove(evt) {
+  evt.preventDefault();
+  const key = document.getElementById('approve-galaxy-key').value.trim();
+  const btn = evt.target.querySelector('button[type=submit]');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Approving…';
+  const fd = new FormData();
+  if (key) fd.append('galaxy_api_key', key);
+  const resp = await fetch(`/api/job/${JOB_ID}/approve_and_align`, {method: 'POST', body: fd});
+  const data = await resp.json();
+  if (data.error) { alert(data.error); btn.disabled = false; btn.textContent = 'Approve & align'; return false; }
+  document.getElementById('review-card').style.display = 'none';
+  if (!polling) polling = setInterval(pollStatus, 3000);
+  pollStatus();
+  return false;
+}
+
+async function confirmNj() {
+  const resp = await fetch(`/api/job/${JOB_ID}/confirm_nj`, {method: 'POST'});
+  const data = await resp.json();
+  if (data.error) { alert(data.error); return; }
+  document.getElementById('confirm-card').style.display = 'none';
+  document.getElementById('build-ml-card').style.display = '';
+}
 
 async function doReroot(evt, which) {
   evt.preventDefault();
@@ -156,6 +345,7 @@ async function submitBuildMl(evt) {
   document.getElementById('ml-card').style.display = '';
   document.getElementById('ml-message').textContent = data.message || 'Running…';
   if (!polling) polling = setInterval(pollStatus, 3000);
+  pollStatus();
   return false;
 }
 

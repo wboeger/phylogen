@@ -1,9 +1,11 @@
 import io
 import os
+import re
 import shutil
 import threading
 import time
 import zipfile
+from datetime import datetime, timezone
 
 from flask import (Blueprint, abort, current_app, g, jsonify, redirect,
                     render_template, request, send_file, url_for)
@@ -36,6 +38,43 @@ def _owns(job):
     return job.session_id == g.session_id
 
 
+def _parse_fragments(form):
+    """Build the job's fragment list from checked presets plus any repeated
+    custom-fragment rows. Returns (fragments, errors)."""
+    fragments, errors, seen_codes = [], [], set()
+
+    for code in form.getlist('fragment_codes'):
+        if code in pipeline.MARKER_PRESETS and code not in seen_codes:
+            info = pipeline.MARKER_PRESETS[code]
+            fragments.append({'code': code, 'label': f'{code} — {info["label"]}',
+                               'query': info['query'], 'min_length': info['min_length']})
+            seen_codes.add(code)
+
+    names = form.getlist('custom_fragment_name')
+    queries = form.getlist('custom_fragment_query')
+    minlens = form.getlist('custom_fragment_minlen')
+    for i, (name, query) in enumerate(zip(names, queries)):
+        name, query = name.strip(), query.strip()
+        if not name and not query:
+            continue
+        if not name or not query:
+            errors.append(f'Custom fragment #{i + 1}: give it both a name and a search query.')
+            continue
+        code = re.sub(r'[^A-Za-z0-9_]', '', name.replace(' ', '_'))[:20] or f'FRAG{i + 1}'
+        while code in seen_codes:
+            code = f'{code}_'
+        seen_codes.add(code)
+        try:
+            min_len = int(minlens[i]) if i < len(minlens) and minlens[i] else 300
+        except ValueError:
+            min_len = 300
+        fragments.append({'code': code, 'label': name, 'query': query, 'min_length': min_len})
+
+    if not fragments:
+        errors.append('Select at least one marker, or add a custom fragment.')
+    return fragments, errors
+
+
 # ── Create ───────────────────────────────────────────────────────────────────
 
 @jobs_bp.route('/jobs', methods=['POST'])
@@ -46,9 +85,6 @@ def create_job():
     ncbi_api_key = (f.get('ncbi_api_key') or '').strip()
     galaxy_api_key = (f.get('galaxy_api_key') or '').strip()
     input_mode = f.get('input_mode', 'manual')
-    marker = f.get('marker', 'COI')
-    custom_query = (f.get('custom_query') or '').strip()
-    min_length_raw = (f.get('min_length') or '').strip()
     outgroup_text = f.get('outgroup_text', '')
 
     errors = []
@@ -73,23 +109,8 @@ def create_job():
         taxon_query = None
         species_text = None
 
-    if marker == 'custom':
-        if not custom_query:
-            errors.append('Enter a custom NCBI search query, or pick a preset marker.')
-        gene_query = custom_query
-        default_min_length = 400
-    elif marker in pipeline.MARKER_PRESETS:
-        gene_query = pipeline.MARKER_PRESETS[marker]['query']
-        default_min_length = pipeline.MARKER_PRESETS[marker]['min_length']
-    else:
-        errors.append('Unknown marker.')
-        gene_query = ''
-        default_min_length = 400
-
-    try:
-        min_length = int(min_length_raw) if min_length_raw else default_min_length
-    except ValueError:
-        min_length = default_min_length
+    fragments, frag_errors = _parse_fragments(f)
+    errors.extend(frag_errors)
 
     try:
         taxon_max_species = int(f.get('taxon_max_species') or 40)
@@ -109,9 +130,7 @@ def create_job():
         species_text=species_text,
         taxon_query=taxon_query,
         taxon_max_species=taxon_max_species,
-        marker=marker,
-        gene_query=gene_query,
-        min_length=min_length,
+        fragments=fragments,
         outgroup_text='\n'.join(_lines(outgroup_text)) or None,
         status='created',
         status_message='Job created — starting…',
@@ -123,14 +142,14 @@ def create_job():
                       galaxy_api_key=galaxy_api_key)
 
     app_obj = current_app._get_current_object()
-    threading.Thread(target=_pipeline_thread, args=(app_obj, job.id), daemon=True).start()
+    threading.Thread(target=_fetch_thread, args=(app_obj, job.id), daemon=True).start()
 
     return redirect(url_for('jobs.job_detail', job_id=job.id))
 
 
-# ── Background pipeline ──────────────────────────────────────────────────────
+# ── Stage 1: fetch (pauses at 'fetched' for user review) ────────────────────
 
-def _pipeline_thread(app, job_id):
+def _fetch_thread(app, job_id):
     with app.app_context():
         job = db.session.get(Job, job_id)
         if not job:
@@ -141,15 +160,14 @@ def _pipeline_thread(app, job_id):
                            'pipeline started (they expire after inactivity) — please retry.')
             return
         try:
-            _run_pipeline(job, creds)
+            _run_fetch(job, creds)
         except Exception as exc:
             _fail(job_id, str(exc))
 
 
-def _run_pipeline(job, creds):
+def _run_fetch(job, creds):
     email = creds['ncbi_email']
     ncbi_key = creds.get('ncbi_api_key')
-    galaxy_key = creds['galaxy_api_key']
 
     def progress(msg):
         job.status_message = msg
@@ -158,63 +176,151 @@ def _run_pipeline(job, creds):
     job.status = 'fetching'
     db.session.commit()
 
-    if job.input_mode == 'manual':
-        species = _lines(job.species_text)
-        records, found, missing = pipeline.fetch_species_list(
-            species, job.gene_query, email, ncbi_key, job.min_length, progress)
-        job.species_found = found
-        job.species_missing = missing
-    else:
-        records, found, n_total = pipeline.fetch_taxon(
-            job.taxon_query, job.gene_query, email, ncbi_key, job.min_length,
-            job.taxon_max_species, progress)
-        job.species_found = found
-        job.species_missing = []
-        if n_total > job.taxon_max_species:
-            progress(f'Found {n_total} species with hits; capped to {job.taxon_max_species}.')
+    outgroup_names = _lines(job.outgroup_text) if job.outgroup_text else []
+    fetch_results = {}
+    fragment_files = {}
+    all_species_seen = set()
+
+    for frag in job.fragments:
+        code, query, min_len = frag['code'], frag['query'], frag['min_length']
+        progress(f'[{code}] Searching NCBI…')
+
+        if job.input_mode == 'manual':
+            species = _lines(job.species_text)
+            records, _found, missing = pipeline.fetch_species_list(
+                species, query, email, ncbi_key, min_len, progress)
+        else:
+            records, _found, n_total = pipeline.fetch_taxon(
+                job.taxon_query, query, email, ncbi_key, min_len, job.taxon_max_species, progress)
+            missing = []
+            if n_total > job.taxon_max_species:
+                progress(f'[{code}] {n_total} species had hits; capped to {job.taxon_max_species}.')
+
+        og_records, og_missing = [], []
+        if outgroup_names:
+            og_records, _f, og_missing = pipeline.fetch_species_list(
+                outgroup_names, query, email, ncbi_key, min_len, progress)
+
+        combined = list(records) + list(og_records)
+        fetch_results[code] = {
+            'label': frag['label'],
+            'found': pipeline.summarize_fetch(combined),
+            'missing': missing,
+            'outgroup_missing': og_missing,
+            'n_sequences': len(combined),
+        }
+
+        raw_path = os.path.join(job.result_dir, f'{code}_raw.fasta')
+        pipeline.write_fasta(combined, raw_path)
+        fragment_files[code] = {'raw': raw_path}
+        for r in combined:
+            all_species_seen.add(r.id.split('|', 1)[1] if '|' in r.id else r.id)
+
+    job.fetch_results = fetch_results
+    job.fragment_files = fragment_files
+    if not all_species_seen:
+        raise RuntimeError('No sequences were found for any fragment/species combination. '
+                            'Try different markers, or broaden the species/taxon.')
+    job.n_sequences = sum(v['n_sequences'] for v in fetch_results.values())
+    job.status = 'fetched'
+    job.status_message = (
+        f'Fetched {len(job.fragments)} fragment(s) across {len(all_species_seen)} species. '
+        f'Review the sequences below, then approve to align.')
     db.session.commit()
 
-    outgroup_records = []
-    if job.outgroup_text:
-        names = _lines(job.outgroup_text)
-        outgroup_records, _og_found, og_missing = pipeline.fetch_species_list(
-            names, job.gene_query, email, ncbi_key, job.min_length, progress)
-        if og_missing:
-            progress(f'No sequence found for outgroup(s): {", ".join(og_missing)}.')
 
-    all_records = list(records) + list(outgroup_records)
-    if len(all_records) < 3:
-        raise RuntimeError(
-            f'Only {len(all_records)} sequence(s) recovered — at least 3 are needed to '
-            f'build a tree. Try a different marker, broaden the species/taxon, or check spelling.')
+# ── Stage 2: user approves -> align + trim + concatenate + NJ ───────────────
 
-    raw_path = os.path.join(job.result_dir, 'raw.fasta')
-    pipeline.write_fasta(all_records, raw_path)
-    job.raw_fasta_path = raw_path
-    job.n_sequences = len(all_records)
-    db.session.commit()
+@jobs_bp.route('/api/job/<job_id>/approve_and_align', methods=['POST'])
+def approve_and_align(job_id):
+    job = db.session.get(Job, job_id) or abort(404)
+    if job.status != 'fetched':
+        return jsonify({'error': f'Job is not awaiting approval (status: {job.status}).'}), 400
+
+    creds = secret_cache.get(job_id) or {}
+    galaxy_api_key = (request.form.get('galaxy_api_key') or '').strip() or creds.get('galaxy_api_key')
+    if not galaxy_api_key:
+        return jsonify({'error': 'A usegalaxy.eu API key is required to align/trim.'}), 400
+    secret_cache.put(job_id, **{**creds, 'galaxy_api_key': galaxy_api_key})
 
     job.status = 'aligning'
-    progress(f'{len(all_records)} sequences fetched. Aligning on Galaxy (MAFFT)…')
-
-    aligned_path = os.path.join(job.result_dir, 'aligned.fasta')
-    trimmed_path = os.path.join(job.result_dir, 'trimmed.fasta')
-    _, _, flipped, trim_skipped = pipeline.galaxy_align_trim(
-        galaxy_key, raw_path, aligned_path, trimmed_path)
-    job.aligned_fasta_path = aligned_path
-    job.trimmed_fasta_path = trimmed_path
+    job.status_message = 'Approved. Aligning fragment(s) on Galaxy…'
     db.session.commit()
 
-    note = ''
-    if flipped:
-        note += f' {len(flipped)} sequence(s) reverse-complemented to match orientation.'
-    if trim_skipped:
-        note += ' trimAl produced no usable output — using the untrimmed alignment.'
+    app_obj = current_app._get_current_object()
+    threading.Thread(target=_align_thread, args=(app_obj, job_id), daemon=True).start()
+    return jsonify({'status': 'aligning'})
+
+
+def _align_thread(app, job_id):
+    with app.app_context():
+        job = db.session.get(Job, job_id)
+        if not job:
+            return
+        creds = secret_cache.get(job_id) or {}
+        galaxy_key = creds.get('galaxy_api_key')
+        if not galaxy_key:
+            _fail(job_id, 'Galaxy API key is no longer available — please retry from the review step.')
+            return
+        try:
+            _run_align_concat_nj(job, galaxy_key)
+        except Exception as exc:
+            _fail(job_id, str(exc))
+
+
+def _run_align_concat_nj(job, galaxy_key):
+    def progress(msg):
+        job.status_message = msg
+        db.session.commit()
+
+    fragment_files = dict(job.fragment_files or {})
+    frag_paths = []
+    for frag in job.fragments:
+        code = frag['code']
+        raw_path = fragment_files.get(code, {}).get('raw')
+        if not raw_path or pipeline.count_fasta(raw_path) < 2:
+            progress(f'[{code}] Skipped — fewer than 2 sequences were fetched for this fragment.')
+            continue
+
+        progress(f'[{code}] Aligning on Galaxy (MAFFT)…')
+        aligned_path = os.path.join(job.result_dir, f'{code}_aligned.fasta')
+        trimmed_path = os.path.join(job.result_dir, f'{code}_trimmed.fasta')
+        _, _, flipped, trim_skipped = pipeline.galaxy_align_trim(
+            galaxy_key, raw_path, aligned_path, trimmed_path)
+
+        model = pipeline.estimate_model(trimmed_path)
+        n_seq = pipeline.count_fasta(trimmed_path)
+        fragment_files[code] = {**fragment_files.get(code, {}), 'aligned': aligned_path,
+                                 'trimmed': trimmed_path, 'model': model, 'n_sequences': n_seq}
+        frag_paths.append((trimmed_path, code))
+
+        note = ''
+        if flipped:
+            note += f' {len(flipped)} sequence(s) reverse-complemented.'
+        if trim_skipped:
+            note += ' trimAl produced no usable output; using the untrimmed alignment.'
+        progress(f'[{code}] Aligned & trimmed ({n_seq} sequences). Estimated model: {model}.{note}')
+
+    job.fragment_files = fragment_files
+    db.session.commit()
+
+    if not frag_paths:
+        raise RuntimeError('No fragment had enough sequences to align. '
+                            'Try different markers, or broaden the species/taxon.')
+
+    concat_path = os.path.join(job.result_dir, 'concat_trimmed.fasta')
+    n_taxa, partition_spec, coverage = pipeline.concatenate_fragments(frag_paths, concat_path)
+    job.concat_path = concat_path
+    job.partition_spec = partition_spec
+    job.species_coverage = coverage
+    job.n_sequences = n_taxa
+    db.session.commit()
 
     job.status = 'nj_running'
-    progress('Computing neighbor-joining preview tree…' + note)
+    progress(f'Concatenated {len(frag_paths)} fragment(s) across {n_taxa} taxa. Computing NJ tree…')
     try:
-        nj = pipeline.local_nj_tree(trimmed_path)
+        models = {code: v.get('model') for code, v in fragment_files.items()}
+        nj = pipeline.local_nj_tree_partitioned(concat_path, partition_spec, models)
         job.nj_newick = nj
         if job.outgroup_text:
             rooted, rooted_on, not_found = pipeline.reroot_newick(nj, _lines(job.outgroup_text))
@@ -222,12 +328,23 @@ def _run_pipeline(job, creds):
             job.nj_root_note = f'Rooted on {rooted_on}.' + (
                 f' Not found in tree: {", ".join(not_found)}.' if not_found else '')
         job.status = 'nj_ready'
-        job.status_message = (f'Tree ready ({job.n_sequences} sequences).{note} '
-                               f'Download the results, or build a bootstrapped ML tree below.')
+        job.status_message = (
+            f'Tree ready ({n_taxa} taxa, {len(frag_paths)} fragment(s)). Review the sequences '
+            f'included below, then confirm to enable the bootstrapped ML tree build.')
     except Exception as exc:
         job.status = 'trimmed'
-        job.status_message = f'Alignment/trim complete, but the NJ preview failed: {exc}.{note}'
+        job.status_message = f'Alignment/trim/concatenation complete, but the NJ preview failed: {exc}'
     db.session.commit()
+
+
+@jobs_bp.route('/api/job/<job_id>/confirm_nj', methods=['POST'])
+def confirm_nj(job_id):
+    job = db.session.get(Job, job_id) or abort(404)
+    if job.status not in ('nj_ready', 'trimmed'):
+        return jsonify({'error': 'Nothing to confirm yet.'}), 400
+    job.nj_confirmed = True
+    db.session.commit()
+    return jsonify({'status': 'ok'})
 
 
 # ── ML tree (Galaxy RAxML-NG) ────────────────────────────────────────────────
@@ -235,8 +352,10 @@ def _run_pipeline(job, creds):
 @jobs_bp.route('/api/job/<job_id>/build_ml', methods=['POST'])
 def build_ml(job_id):
     job = db.session.get(Job, job_id) or abort(404)
-    if not job.trimmed_fasta_path or not os.path.exists(job.trimmed_fasta_path):
-        return jsonify({'error': 'No trimmed alignment available yet.'}), 400
+    if not job.nj_confirmed:
+        return jsonify({'error': 'Confirm the sequences included in the NJ tree first.'}), 400
+    if not job.concat_path or not os.path.exists(job.concat_path):
+        return jsonify({'error': 'No concatenated alignment available yet.'}), 400
     galaxy_api_key = (request.form.get('galaxy_api_key') or '').strip()
     if not galaxy_api_key:
         cached = secret_cache.get(job_id)
@@ -248,6 +367,7 @@ def build_ml(job_id):
 
     job.ml_status = 'running'
     job.ml_message = 'Submitting alignment to Galaxy RAxML-NG…'
+    job.ml_started_at = datetime.now(timezone.utc)
     db.session.commit()
 
     app_obj = current_app._get_current_object()
@@ -262,7 +382,11 @@ def _raxml_thread(app, job_id, galaxy_key):
         if not job:
             return
         try:
-            hist, gjob = pipeline.submit_raxml(job.trimmed_fasta_path, galaxy_key)
+            fragment_files = job.fragment_files or {}
+            partition_models = {code: v.get('model', 'GTR+G') for code, v in fragment_files.items()}
+            hist, gjob = pipeline.submit_raxml(
+                job.concat_path, galaxy_key, partition_spec=job.partition_spec,
+                partition_models=partition_models)
             job.galaxy_history_id = hist
             job.galaxy_job_id = gjob
             job.ml_message = 'RAxML-NG running on usegalaxy.eu (ML search + bootstrap)…'
@@ -348,33 +472,44 @@ def reroot(job_id):
 @jobs_bp.route('/job/<job_id>/download.zip')
 def download_zip(job_id):
     job = db.session.get(Job, job_id) or abort(404)
+    fragment_files = job.fragment_files or {}
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
         readme = [
             f'phylogen job {job.id}',
             f'created: {job.created_at}',
             f'input mode: {job.input_mode}',
-            f'marker: {job.marker}',
-            f'NCBI query: {job.gene_query}',
-            f'min length: {job.min_length}',
         ]
         if job.input_mode == 'manual':
             readme.append(f'species requested: {job.species_text}')
         else:
             readme.append(f'taxon: {job.taxon_query} (max {job.taxon_max_species} species)')
-        if job.species_found:
-            readme.append(f'species recovered: {", ".join(job.species_found)}')
-        if job.species_missing:
-            readme.append(f'species NOT found: {", ".join(job.species_missing)}')
         if job.outgroup_text:
             readme.append(f'outgroup: {job.outgroup_text}')
+        readme.append('')
+        readme.append('fragments:')
+        for frag in job.fragments:
+            code = frag['code']
+            info = fragment_files.get(code, {})
+            readme.append(f"  {code}: query=\"{frag['query']}\" min_length={frag['min_length']} "
+                           f"model={info.get('model', 'n/a')} n_sequences={info.get('n_sequences', 'n/a')}")
+            fr = (job.fetch_results or {}).get(code, {})
+            if fr.get('missing'):
+                readme.append(f"    not found: {', '.join(fr['missing'])}")
+        if job.species_coverage:
+            readme.append('')
+            readme.append('species -> fragments included in the concatenated tree:')
+            for sp, cov in sorted(job.species_coverage.items()):
+                readme.append(f'  {sp}: {cov}')
         zf.writestr('README.txt', '\n'.join(readme) + '\n')
 
-        for label, path in (('raw.fasta', job.raw_fasta_path),
-                             ('aligned.fasta', job.aligned_fasta_path),
-                             ('trimmed.fasta', job.trimmed_fasta_path)):
-            if path and os.path.exists(path):
-                zf.write(path, label)
+        for code, info in fragment_files.items():
+            for label, key in (('raw', 'raw'), ('aligned', 'aligned'), ('trimmed', 'trimmed')):
+                path = info.get(key)
+                if path and os.path.exists(path):
+                    zf.write(path, f'{code}_{label}.fasta')
+        if job.concat_path and os.path.exists(job.concat_path):
+            zf.write(job.concat_path, 'concat_trimmed.fasta')
         if job.nj_newick:
             zf.writestr('nj_tree.nwk', job.nj_newick)
         if job.nj_rooted_newick:

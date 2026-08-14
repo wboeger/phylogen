@@ -58,7 +58,7 @@
         <div class="field">
           <label for="taxon_query">Higher taxon (genus, family, order…)</label>
           <input type="text" name="taxon_query" id="taxon_query" placeholder="e.g. Salmonidae" value="{{ form.taxon_query if form else '' }}">
-          <div class="hint">Searches NCBI for every descendant species with a hit for the chosen marker.</div>
+          <div class="hint">Searches NCBI for every descendant species with a hit for each chosen marker.</div>
         </div>
         <div class="field">
           <label for="taxon_max_species">Max species to include</label>
@@ -68,24 +68,23 @@
     </fieldset>
 
     <fieldset>
-      <legend>Marker / gene</legend>
-      <div class="field">
-        <label for="marker">Marker</label>
-        <select name="marker" id="marker" onchange="onMarkerChange()">
-          {% for code, info in markers.items() %}
-          <option value="{{ code }}" data-query="{{ info.query }}" data-minlen="{{ info.min_length }}">{{ code }} — {{ info.label }}</option>
-          {% endfor %}
-          <option value="custom">Custom NCBI query…</option>
-        </select>
+      <legend>Markers / fragments</legend>
+      <div class="hint" style="margin-bottom:10px;">
+        Pick one or more. Each is fetched independently per species; two or more are aligned/trimmed
+        separately, then concatenated into a partitioned alignment (its own estimated substitution
+        model per fragment) for the tree.
       </div>
-      <div class="field" id="custom-query-field" style="display:none;">
-        <label for="custom_query">Custom NCBI nuccore search term</label>
-        <textarea name="custom_query" id="custom_query" placeholder='e.g. rpoB[Gene] AND 500:3000[SLEN]'>{{ form.custom_query if form else '' }}</textarea>
+      <div class="fragment-grid">
+        {% for code, info in markers.items() %}
+        <label class="fragment-check">
+          <input type="checkbox" name="fragment_codes" value="{{ code }}" {{ 'checked' if code == 'COI' else '' }}>
+          <span><strong>{{ code }}</strong> &mdash; {{ info.label }}</span>
+        </label>
+        {% endfor %}
       </div>
-      <div class="field">
-        <label for="min_length">Minimum sequence length (bp)</label>
-        <input type="number" name="min_length" id="min_length" value="{{ form.min_length if form else 400 }}" min="1">
-      </div>
+
+      <div id="custom-fragments"></div>
+      <button type="button" class="btn-secondary" onclick="addCustomFragment()" style="margin-top:12px;">+ Add custom fragment</button>
     </fieldset>
 
     <fieldset>
@@ -124,8 +123,8 @@
   <div class="job-row">
     <div>
       <div class="title"><a href="{{ url_for('jobs.job_detail', job_id=job.id) }}">
-        {{ job.taxon_query or (job.species_found and (job.species_found|length) ~ ' species') or (job.species_text or '').splitlines()|length ~ ' species requested' }}
-        — {{ job.marker }}</a></div>
+        {{ job.taxon_query or ((job.species_text or '').splitlines()|length ~ ' species requested') }}
+        &mdash; {{ job.fragments|map(attribute='code')|join('+') }}</a></div>
       <div class="meta">{{ job.created_at.strftime('%Y-%m-%d %H:%M') }} UTC</div>
     </div>
     <span class="badge status-{{ job.status }}">{{ job.status.replace('_', ' ') }}</span>
@@ -135,25 +134,33 @@
 {% endif %}
 
 <script>
-const MARKERS = {};
-document.querySelectorAll('#marker option[data-query]').forEach(o => {
-  MARKERS[o.value] = {query: o.dataset.query, minlen: o.dataset.minlen};
-});
-
 function setMode(mode) {
   document.getElementById('panel-manual').classList.toggle('active', mode === 'manual');
   document.getElementById('panel-taxon').classList.toggle('active', mode === 'taxon');
 }
 
-function onMarkerChange() {
-  const sel = document.getElementById('marker');
-  const isCustom = sel.value === 'custom';
-  document.getElementById('custom-query-field').style.display = isCustom ? 'block' : 'none';
-  if (!isCustom && MARKERS[sel.value]) {
-    document.getElementById('min_length').value = MARKERS[sel.value].minlen;
-  }
+let customFragCount = 0;
+function addCustomFragment() {
+  customFragCount++;
+  const div = document.createElement('div');
+  div.className = 'card on-canvas custom-fragment-row';
+  div.innerHTML = `
+    <div class="field">
+      <label>Fragment name</label>
+      <input type="text" name="custom_fragment_name" placeholder="e.g. rpoB">
+    </div>
+    <div class="field">
+      <label>NCBI search query</label>
+      <textarea name="custom_fragment_query" placeholder="rpoB[Gene] AND 500:3000[SLEN]"></textarea>
+    </div>
+    <div class="field" style="margin-bottom:0;">
+      <label>Minimum length (bp)</label>
+      <input type="number" name="custom_fragment_minlen" value="300" min="1">
+    </div>
+    <button type="button" class="btn-danger" style="margin-top:12px;" onclick="this.closest('.custom-fragment-row').remove()">Remove</button>
+  `;
+  document.getElementById('custom-fragments').appendChild(div);
 }
-onMarkerChange();
 
 document.getElementById('new-job-form').addEventListener('submit', function() {
   const btn = this.querySelector('button[type=submit]');

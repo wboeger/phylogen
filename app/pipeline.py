@@ -218,6 +218,20 @@ def fetch_taxon(taxon, gene_query, email, api_key, min_length, max_species=40, p
     return capped, species_found, n_total_species
 
 
+def summarize_fetch(records):
+    """Review-table summary for the pre-align confirmation screen: one row per
+    recovered sequence (species, accession, length)."""
+    found = []
+    for r in records:
+        if '|' in r.id:
+            acc, sp = r.id.split('|', 1)
+        else:
+            acc, sp = r.id, r.id
+        found.append({'species': sp.replace('_', ' '), 'accession': acc, 'length': len(r.seq)})
+    found.sort(key=lambda row: row['species'])
+    return found
+
+
 def write_fasta(records, path):
     from Bio import SeqIO
     with open(path, 'w') as fh:
@@ -282,6 +296,190 @@ def local_nj_tree(trimmed_path):
     alignment = AlignIO.read(trimmed_path, 'fasta')
     calc = DistanceCalculator('identity')
     dm = calc.get_distance(alignment)
+    nj_tree = DistanceTreeConstructor().nj(dm)
+    buf = io.StringIO()
+    Phylo.write(nj_tree, buf, 'newick')
+    return buf.getvalue().strip()
+
+
+# ── Substitution model estimation ─────────────────────────────────────────────
+# No local ModelTest-NG binary is available on Railway (same constraint as
+# MAFFT/trimAl), so this is a fast, always-available heuristic — base
+# composition homogeneity + transition/transversion ratio — rather than a full
+# BIC search across candidate models. Good enough to pick a sensible RAxML-NG
+# model string per fragment; NOT a substitute for a real ModelTest-NG run.
+_PURINES = frozenset('AG')
+
+
+def estimate_model(trimmed_path, max_pairs=200):
+    """Returns a model string ('JC+G' | 'K80+G' | 'HKY+G' | 'GTR+G') estimated
+    from base-frequency skew and the observed ts/tv ratio in the alignment."""
+    from Bio import AlignIO
+    try:
+        aln = AlignIO.read(trimmed_path, 'fasta')
+    except Exception:
+        return 'GTR+G'
+    seqs = [str(r.seq).upper() for r in aln]
+    if len(seqs) < 2:
+        return 'GTR+G'
+
+    counts = {'A': 0, 'C': 0, 'G': 0, 'T': 0}
+    for s in seqs:
+        for b in s:
+            if b in counts:
+                counts[b] += 1
+    total = sum(counts.values())
+    if total == 0:
+        return 'GTR+G'
+    max_dev = max(abs(counts[b] / total - 0.25) for b in counts)
+
+    ts = tv = n_pairs = 0
+    for i in range(len(seqs)):
+        if n_pairs > max_pairs:
+            break
+        for j in range(i + 1, len(seqs)):
+            n_pairs += 1
+            for a, b in zip(seqs[i], seqs[j]):
+                if a not in 'ACGT' or b not in 'ACGT' or a == b:
+                    continue
+                if (a in _PURINES) == (b in _PURINES):
+                    ts += 1
+                else:
+                    tv += 1
+            if n_pairs > max_pairs:
+                break
+    ts_tv = (ts / tv) if tv else (2.0 if ts else 1.0)
+
+    even_freqs = max_dev < 0.04
+    strong_titv = ts_tv > 1.3
+    if even_freqs and not strong_titv:
+        base = 'JC'
+    elif even_freqs and strong_titv:
+        base = 'K80'
+    elif not even_freqs and strong_titv:
+        base = 'HKY'
+    else:
+        base = 'GTR'
+    return f'{base}+G'
+
+
+# ── Fragment concatenation (multi-marker) ─────────────────────────────────────
+
+def concatenate_fragments(frag_paths, out_path):
+    """frag_paths: list of (trimmed_path, fragment_code). Concatenates trimmed
+    alignments; a taxon missing one fragment gets all-gap columns for it.
+    Returns (n_taxa, partition_spec, species_coverage): partition_spec is
+    [{'name','start','end'}] (1-based inclusive column ranges), species_coverage
+    maps 'genus species' (lowercase) -> '+'.join(fragment codes present)."""
+    from Bio import SeqIO
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+
+    loaded = []
+    for path, code in frag_paths:
+        by_sp = {}
+        for r in SeqIO.parse(path, 'fasta'):
+            sp = r.id.split('|', 1)[1] if '|' in r.id else r.id
+            by_sp[sp] = r
+        width = len(next(iter(by_sp.values())).seq) if by_sp else 0
+        loaded.append((code, by_sp, width))
+
+    all_sp = sorted({sp for _, by_sp, _ in loaded for sp in by_sp})
+    records, coverage = [], {}
+    for sp in all_sp:
+        seq_parts, marks, rec_id = [], [], None
+        for code, by_sp, width in loaded:
+            r = by_sp.get(sp)
+            if r is not None:
+                seq_parts.append(str(r.seq))
+                marks.append(code)
+                rec_id = rec_id or r.id
+            else:
+                seq_parts.append('-' * width)
+        records.append(SeqRecord(Seq(''.join(seq_parts)), id=rec_id or sp, name='', description=''))
+        coverage[sp.replace('_', ' ').lower()] = '+'.join(marks)
+
+    write_fasta(records, out_path)
+    spec, cursor = [], 1
+    for code, _by_sp, width in loaded:
+        spec.append({'name': code, 'start': cursor, 'end': cursor + width - 1})
+        cursor += width
+    return len(records), spec, coverage
+
+
+# ── Model-corrected partitioned NJ ────────────────────────────────────────────
+
+def _p_distance_correction(model):
+    """Map an estimated/RAxML-NG model string to a distance-correction family:
+    'JC' (Jukes-Cantor) for simple models, 'K80' (Kimura-2P) when the model
+    distinguishes transitions/transversions (K80/HKY/GTR/...)."""
+    if not model:
+        return 'JC'
+    m = model.upper()
+    if any(t in m for t in ('K80', 'K2P', 'HKY', 'TN', 'TIM', 'TVM', 'GTR', 'SYM')):
+        return 'K80'
+    return 'JC'
+
+
+def _corrected_pair_distance(si, sj, fam):
+    import math
+    sites = ts = tv = 0
+    for a, b in zip(si, sj):
+        if a not in 'ACGT' or b not in 'ACGT':
+            continue
+        sites += 1
+        if a == b:
+            continue
+        if (a in _PURINES) == (b in _PURINES):
+            ts += 1
+        else:
+            tv += 1
+    if sites == 0:
+        return 0.0, 0
+    if fam == 'K80':
+        P, Q = ts / sites, tv / sites
+        try:
+            d = -0.5 * math.log(1 - 2 * P - Q) - 0.25 * math.log(1 - 2 * Q)
+        except ValueError:
+            d = 2.0
+    else:
+        p = (ts + tv) / sites
+        try:
+            d = -0.75 * math.log(1 - 4 / 3 * p)
+        except ValueError:
+            d = 2.0
+    if not (d == d) or d < 0:
+        d = 2.0
+    return d, sites
+
+
+def local_nj_tree_partitioned(concat_path, partition_spec, models):
+    """NJ tree from a concatenated alignment using model-corrected pairwise
+    distances per partition (models: {fragment_code: model_string}), combined
+    weighted by comparable sites per partition."""
+    from Bio import AlignIO, Phylo
+    from Bio.Phylo.TreeConstruction import DistanceMatrix, DistanceTreeConstructor
+    import io
+
+    aln = AlignIO.read(concat_path, 'fasta')
+    ids = [rec.id for rec in aln]
+    seqs = [str(rec.seq).upper() for rec in aln]
+    n = len(ids)
+    parts = [(p['start'] - 1, p['end'], _p_distance_correction(models.get(p['name'])))
+             for p in (partition_spec or [])]
+    if not parts:
+        parts = [(0, len(seqs[0]) if seqs else 0, 'JC')]
+
+    matrix = [[0.0] * (i + 1) for i in range(n)]
+    for i in range(n):
+        for j in range(i):
+            dacc = wacc = 0.0
+            for s0, s1, fam in parts:
+                d, w = _corrected_pair_distance(seqs[i][s0:s1], seqs[j][s0:s1], fam)
+                dacc += d * w
+                wacc += w
+            matrix[i][j] = (dacc / wacc) if wacc else 1.0
+    dm = DistanceMatrix(ids, matrix)
     nj_tree = DistanceTreeConstructor().nj(dm)
     buf = io.StringIO()
     Phylo.write(nj_tree, buf, 'newick')
@@ -533,9 +731,30 @@ def _galaxy_find_tool_id(api_key, needle):
     return seg[0] if seg else None
 
 
-def submit_raxml(fasta_path, api_key, n_bootstraps=1000, model='GTR+G'):
-    """Upload the trimmed alignment and run RAxML-NG (--all: ML search +
-    bootstrap + support) on Galaxy. Returns (history_id, galaxy_job_id)."""
+def _write_raxmlng_partition_file(partition_spec, partition_models, out_path):
+    """Write a RAxML-NG partition file: one '<model>, <name> = <start>-<end>'
+    line per fragment. Returns out_path, or None if there is nothing to write."""
+    lines = []
+    for p in (partition_spec or []):
+        if p.get('end', 0) < p.get('start', 1):
+            continue
+        model = (partition_models or {}).get(p['name']) or 'GTR+G'
+        lines.append(f"{model}, {p['name']} = {p['start']}-{p['end']}")
+    if not lines:
+        return None
+    with open(out_path, 'w') as fh:
+        fh.write('\n'.join(lines) + '\n')
+    return out_path
+
+
+def submit_raxml(fasta_path, api_key, n_bootstraps=1000, model='GTR+G',
+                  partition_spec=None, partition_models=None):
+    """Upload the (possibly concatenated) alignment and run RAxML-NG (--all: ML
+    search + bootstrap + support) on Galaxy. Returns (history_id, galaxy_job_id).
+
+    With more than one partition, a RAxML-NG partition file (one model per
+    fragment, from `partition_models`) is uploaded and passed via
+    model_type=multi_file; otherwise a single model string is used."""
     from flask import current_app
     tool_id = current_app.config.get('GALAXY_RAXMLNG_TOOL_ID') or None
     if not tool_id:
@@ -554,12 +773,31 @@ def submit_raxml(fasta_path, api_key, n_bootstraps=1000, model='GTR+G'):
         'general_opts|cmdtype|infile': {'src': 'hda', 'id': ds_id},
         'general_opts|cmdtype|command': '--all',
         'general_opts|cmdtype|bs_metric': 'fbp',
-        'general_opts|cmdtype|model|model_type': 'single_string',
-        'general_opts|cmdtype|model|model_string': model or 'GTR+G',
         'bootstrap_opts|bs_reps': int(n_bootstraps),
         'bootstrap_opts|bs_mre': 'true',
         'random_seed': 1234567890,
     }
+
+    part_path = os.path.join(os.path.dirname(fasta_path), 'raxmlng_partitions.txt')
+    part_file = (_write_raxmlng_partition_file(partition_spec, partition_models, part_path)
+                 if partition_spec and len(partition_spec) > 1 else None)
+    if part_file:
+        part_ds_id, part_job = galaxy_upload_file(api_key, history_id, part_file, 'txt')
+        if part_job:
+            state = galaxy_wait_for_job(api_key, part_job, max_wait=300)
+            if state != 'ok':
+                raise RuntimeError(f'Galaxy partition upload failed (state: {state})')
+        inputs['general_opts|cmdtype|model|model_type'] = 'multi_file'
+        inputs['general_opts|cmdtype|model|model_file'] = {'src': 'hda', 'id': part_ds_id}
+        inputs['general_opts|cmdtype|model|brlen_linkage'] = 'scaled'
+        inputs['general_opts|cmdtype|model|model_file_auto'] = 'false'
+    else:
+        single_model = model
+        if partition_spec and len(partition_spec) == 1:
+            single_model = (partition_models or {}).get(partition_spec[0]['name']) or model
+        inputs['general_opts|cmdtype|model|model_type'] = 'single_string'
+        inputs['general_opts|cmdtype|model|model_string'] = single_model or 'GTR+G'
+
     job_id = galaxy_run_tool(api_key, history_id, tool_id, inputs)
     return history_id, job_id
 
