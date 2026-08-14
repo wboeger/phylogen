@@ -94,6 +94,18 @@ class Job(db.Model):
     galaxy_history_id = db.Column(db.String(64))
     galaxy_job_id = db.Column(db.String(64))
 
+    # Divergence-time dating (IQ-TREE + LSD2 on Galaxy), run on the ML tree
+    # topology once it's ready. calibrations: list of {taxa:[names], min_age,
+    # max_age} (millions of years before present), entered on the job page.
+    calibrations = db.Column(db.JSON)
+    dating_status = db.Column(db.String(20))  # None | running | ready | error
+    dating_message = db.Column(db.Text)
+    dating_started_at = db.Column(db.DateTime)
+    dating_newick = db.Column(db.Text)   # time-scaled tree, internal date labels stripped
+    dating_report = db.Column(db.Text)   # LSD2 report (estimated rate, per-node ages)
+    galaxy_dating_history_id = db.Column(db.String(64))
+    galaxy_dating_job_id = db.Column(db.String(64))
+
     @property
     def created_at_iso(self):
         return _iso_utc(self.created_at)
@@ -158,6 +170,11 @@ class Job(db.Model):
             'ml_root_note': self.ml_root_note,
             'created_at': self.created_at_iso,
             'ml_started_at': _iso_utc(self.ml_started_at),
+            'dating_status': self.dating_status,
+            'dating_message': self.dating_message,
+            'dating_started_at': _iso_utc(self.dating_started_at),
+            'dating_newick': self.dating_newick,
+            'dating_report': self.dating_report,
             'stage_index': stage_index,
             'stage_state': stage_state,
         }

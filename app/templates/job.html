@@ -103,17 +103,64 @@
   </form>
 </div>
 
+<div class="card on-canvas" id="dating-card" style="display:none;">
+  <h3>Estimate divergence times</h3>
+  <p>Runs IQ-TREE's LSD2 dating mode on Galaxy: re-evaluates branch lengths on your ML tree's topology (search fixed, not re-run) and rescales them to time using the calibration points below. <strong>Limitation:</strong> this step uses one substitution model across the whole alignment even for multi-fragment jobs (the RAxML-NG tree above is properly partitioned; this rescaling step is not).</p>
+  <div class="run-status-row">
+    <p class="status-message" id="dating-message" style="margin:0;">{{ job.dating_message or '' }}</p>
+    <span class="elapsed-timer" id="dating-timer" style="display:none;"><span class="live-dot"></span><span id="dating-timer-text">0:00</span></span>
+  </div>
+  <div class="stage-bar" id="dating-stage-bar"></div>
+
+  <form onsubmit="return submitBuildDating(event)" id="build-dating-form" style="{{ 'display:none;' if job.dating_status else '' }}">
+    <label style="margin-top:14px;">Calibration points</label>
+    <p class="hint">One or more clades/tips with a known or estimated age (millions of years before present). Each row's species define a clade's most-recent-common-ancestor if 2+, or a single tip's own age if 1.</p>
+    <div id="calibration-points"></div>
+    <button type="button" class="btn-secondary" onclick="addCalibrationPoint()" style="margin:10px 0 18px;">+ Add calibration point</button>
+
+    <fieldset>
+      <legend>Advanced (optional)</legend>
+      <div class="field" style="max-width:260px;">
+        <label for="dating-date-ci">Confidence-interval replicates</label>
+        <input type="number" id="dating-date-ci" value="100" min="0">
+      </div>
+      <div class="field" style="max-width:260px;">
+        <label for="dating-clock-sd">Relaxed-clock std-dev</label>
+        <input type="number" id="dating-clock-sd" value="0.2" min="0" step="0.05">
+      </div>
+    </fieldset>
+
+    <div class="field" style="max-width:400px;">
+      <label for="dating-galaxy-key">usegalaxy.eu API key (leave blank to reuse the one from the form)</label>
+      <input type="password" id="dating-galaxy-key" placeholder="optional — reuses your original key" autocomplete="off">
+    </div>
+    <button type="submit" class="btn-primary">Estimate divergence times</button>
+  </form>
+
+  <div id="dating-tree-panel" class="tree-panel" style="display:none; margin-top:16px;">
+    <p class="hint" style="margin-top:0;">Branch lengths = million years (Mya). Internal labels are omitted here (they are ages, not support values) — see the LSD2 report below for exact per-node dates.</p>
+    <svg id="dating-svg"></svg>
+  </div>
+  <div id="dating-report-panel" style="display:none; margin-top:16px;">
+    <label>LSD2 report</label>
+    <pre id="dating-report-text" class="mono" style="background:var(--canvas); border:1px solid var(--hairline); border-radius:var(--radius-md); padding:14px; overflow-x:auto; white-space:pre-wrap; font-size:0.78rem;"></pre>
+  </div>
+</div>
+
 <script src="{{ url_for('static', filename='js/tree.js') }}"></script>
 <script>
 const JOB_ID = {{ job.id | tojson }};
 const JOB_CREATED_AT = {{ job.created_at_iso | tojson }};
 const MAIN_STAGES = ['Fetch sequences', 'Review & approve', 'Align & trim', 'Build NJ tree'];
 const ML_STAGES = ['Submit & run on Galaxy', 'Done'];
+const DATING_STAGES = ['Submit & run on Galaxy', 'Done'];
 let polling = null;
 let mainTimerHandle = null;
 let mlTimerHandle = null;
+let datingTimerHandle = null;
 let lastData = null;
 let reviewRendered = false;
+let calPointCount = 0;
 
 function renderIfPresent(id, newick) {
   if (!newick) return;
@@ -293,8 +340,35 @@ function applyStatus(data) {
     }
   }
 
+  if (data.ml_status === 'ready') {
+    document.getElementById('dating-card').style.display = '';
+  }
+  if (data.dating_status) {
+    document.getElementById('dating-message').textContent = data.dating_message || '';
+    const datingRunning = data.dating_status === 'running';
+    const datingIndex = datingRunning ? 0 : 1;
+    const datingState = data.dating_status === 'error' ? 'error' : (datingRunning ? 'active' : 'done');
+    renderStageBar('dating-stage-bar', DATING_STAGES, datingIndex, datingState);
+    document.getElementById('dating-timer').classList.toggle('is-running', datingRunning);
+    document.getElementById('build-dating-form').style.display = (datingRunning || data.dating_status === 'ready') ? 'none' : '';
+    if (datingRunning && data.dating_started_at) {
+      startTimer('dating-timer', 'dating-timer-text', data.dating_started_at,
+                 v => datingTimerHandle = v, () => datingTimerHandle);
+    } else {
+      stopTimer(() => datingTimerHandle, v => datingTimerHandle = v);
+    }
+    if (data.dating_newick) {
+      document.getElementById('dating-tree-panel').style.display = '';
+      renderIfPresent('dating-svg', data.dating_newick);
+    }
+    if (data.dating_report) {
+      document.getElementById('dating-report-panel').style.display = '';
+      document.getElementById('dating-report-text').textContent = data.dating_report;
+    }
+  }
+
   const stillRunning = ['created', 'fetching', 'aligning', 'nj_running'].includes(data.status)
-                        || data.ml_status === 'running';
+                        || data.ml_status === 'running' || data.dating_status === 'running';
   if (!stillRunning && polling) { clearInterval(polling); polling = null; }
 }
 
@@ -308,10 +382,11 @@ async function pollStatus() {
 
 // Render whatever the server already rendered, then poll if still in-flight.
 applyStatus({{ job.to_status_dict() | tojson }});
-{% if job.status in ('created', 'fetching', 'fetched', 'aligning', 'nj_running') or job.ml_status == 'running' %}
+{% if job.status in ('created', 'fetching', 'fetched', 'aligning', 'nj_running') or job.ml_status == 'running' or job.dating_status == 'running' %}
 polling = setInterval(pollStatus, 3000);
 {% endif %}
 
+if (document.getElementById('calibration-points').children.length === 0) addCalibrationPoint();
 async function submitApprove(evt) {
   evt.preventDefault();
   const key = document.getElementById('approve-galaxy-key').value.trim();
@@ -380,6 +455,67 @@ async function submitBuildMl(evt) {
   document.getElementById('build-ml-card').style.display = 'none';
   document.getElementById('ml-card').style.display = '';
   document.getElementById('ml-message').textContent = data.message || 'Running…';
+  if (!polling) polling = setInterval(pollStatus, 3000);
+  pollStatus();
+  return false;
+}
+
+function addCalibrationPoint() {
+  calPointCount++;
+  const div = document.createElement('div');
+  div.className = 'card on-canvas calibration-row';
+  div.style.padding = '16px';
+  div.style.marginTop = '10px';
+  div.innerHTML = `
+    <div class="field" style="margin-bottom:10px;">
+      <label>Species / taxa defining this clade (one per line; 2+ = their MRCA, 1 = that tip's own age)</label>
+      <textarea class="cal-taxa" placeholder="Genus species&#10;Genus species2"></textarea>
+    </div>
+    <div style="display:flex; gap:12px; flex-wrap:wrap;">
+      <div class="field" style="max-width:200px; margin-bottom:0;">
+        <label>Min age (Mya)</label>
+        <input type="number" class="cal-min" min="0" step="0.1">
+      </div>
+      <div class="field" style="max-width:200px; margin-bottom:0;">
+        <label>Max age (Mya)</label>
+        <input type="number" class="cal-max" min="0" step="0.1">
+      </div>
+    </div>
+    <button type="button" class="btn-danger" style="margin-top:10px;" onclick="this.closest('.calibration-row').remove()">Remove</button>
+  `;
+  document.getElementById('calibration-points').appendChild(div);
+}
+
+async function submitBuildDating(evt) {
+  evt.preventDefault();
+  const rows = Array.from(document.querySelectorAll('.calibration-row'));
+  const calibrations = rows.map(row => {
+    const taxa = row.querySelector('.cal-taxa').value.split('\n').map(s => s.trim()).filter(Boolean);
+    const minV = row.querySelector('.cal-min').value;
+    const maxV = row.querySelector('.cal-max').value;
+    return {
+      taxa,
+      min_age: minV === '' ? null : parseFloat(minV),
+      max_age: maxV === '' ? null : parseFloat(maxV),
+    };
+  }).filter(c => c.taxa.length && (c.min_age !== null || c.max_age !== null));
+  if (!calibrations.length) { alert('Add at least one calibration point with species and an age.'); return false; }
+
+  const key = document.getElementById('dating-galaxy-key').value.trim();
+  const dateCi = document.getElementById('dating-date-ci').value;
+  const clockSd = document.getElementById('dating-clock-sd').value;
+  const btn = evt.target.querySelector('button[type=submit]');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…';
+  const fd = new FormData();
+  if (key) fd.append('galaxy_api_key', key);
+  fd.append('calibrations', JSON.stringify(calibrations));
+  if (dateCi) fd.append('date_ci', dateCi);
+  if (clockSd) fd.append('clock_sd', clockSd);
+  const resp = await fetch(`/api/job/${JOB_ID}/build_dating`, {method: 'POST', body: fd});
+  const data = await resp.json();
+  if (data.error) { alert(data.error); btn.disabled = false; btn.textContent = 'Estimate divergence times'; return false; }
+  document.getElementById('build-dating-form').style.display = 'none';
+  document.getElementById('dating-message').textContent = data.message || 'Running…';
   if (!polling) polling = setInterval(pollStatus, 3000);
   pollStatus();
   return false;

@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import re
 import shutil
@@ -463,6 +464,113 @@ def _raxml_thread(app, job_id, galaxy_key):
         db.session.commit()
 
 
+# ── Divergence-time dating (IQ-TREE + LSD2 on Galaxy) ────────────────────────
+
+@jobs_bp.route('/api/job/<job_id>/build_dating', methods=['POST'])
+def build_dating(job_id):
+    job = db.session.get(Job, job_id) or abort(404)
+    if not job.ml_newick or job.ml_status != 'ready':
+        return jsonify({'error': 'Build the ML tree first.'}), 400
+    if job.dating_status == 'running':
+        return jsonify({'error': 'A dating run is already in progress for this job.'}), 400
+
+    galaxy_api_key = (request.form.get('galaxy_api_key') or '').strip()
+    if not galaxy_api_key:
+        cached = secret_cache.get(job_id)
+        galaxy_api_key = (cached or {}).get('galaxy_api_key', '')
+    if not galaxy_api_key:
+        return jsonify({'error': 'A usegalaxy.eu API key is required.'}), 400
+
+    try:
+        calibrations = json.loads(request.form.get('calibrations', '[]'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Malformed calibration data.'}), 400
+    if not isinstance(calibrations, list) or not calibrations:
+        return jsonify({'error': 'Add at least one calibration point.'}), 400
+
+    try:
+        date_ci = max(0, int(request.form.get('date_ci') or 100))
+    except ValueError:
+        date_ci = 100
+    try:
+        clock_sd = float(request.form.get('clock_sd') or 0.2)
+    except ValueError:
+        clock_sd = 0.2
+
+    base_newick = job.ml_rooted_newick or job.ml_newick
+    tip_names = pipeline.newick_tip_names(base_newick)
+    date_path = os.path.join(job.result_dir, 'dating_calibrations.txt')
+    _, matched_rows, unmatched = pipeline.build_calibration_file(calibrations, tip_names, date_path)
+    if not matched_rows:
+        detail = f' Not found: {", ".join(unmatched)}.' if unmatched else ''
+        return jsonify({'error': f'None of the calibration points matched a tip in the tree.{detail}'}), 400
+
+    job.calibrations = calibrations
+    job.dating_status = 'running'
+    warn = f' ({len(unmatched)} name(s) not matched: {", ".join(unmatched)})' if unmatched else ''
+    job.dating_message = f'Submitting to Galaxy (IQ-TREE / LSD2)…{warn}'
+    job.dating_started_at = datetime.now(timezone.utc)
+    db.session.commit()
+
+    app_obj = current_app._get_current_object()
+    threading.Thread(target=_dating_thread,
+                      args=(app_obj, job_id, galaxy_api_key, date_path, date_ci, clock_sd),
+                      daemon=True).start()
+    return jsonify({'status': 'running', 'message': job.dating_message})
+
+
+def _dating_thread(app, job_id, galaxy_key, date_path, date_ci, clock_sd):
+    with app.app_context():
+        job = db.session.get(Job, job_id)
+        if not job:
+            return
+        try:
+            base_newick = job.ml_rooted_newick or job.ml_newick
+            fragment_files = job.fragment_files or {}
+            model = 'GTR+G'
+            if job.fragments:
+                model = fragment_files.get(job.fragments[0]['code'], {}).get('model') or 'GTR+G'
+            outgroup_names = _lines(job.outgroup_text) if job.outgroup_text else None
+
+            hist, gjob = pipeline.submit_dating(
+                job.concat_path, base_newick, date_path, galaxy_key, model=model,
+                outgroup_names=outgroup_names, date_ci=date_ci, clock_sd=clock_sd)
+            job.galaxy_dating_history_id = hist
+            job.galaxy_dating_job_id = gjob
+            job.dating_message = 'IQ-TREE / LSD2 running on usegalaxy.eu…'
+            db.session.commit()
+
+            deadline = time.time() + 3 * 3600
+            stage = 'RUNNING'
+            while time.time() < deadline:
+                stage, msg = pipeline.galaxy_check_status(galaxy_key, gjob)
+                job.dating_message = f'{stage}: {(msg or "")[:300]}'
+                db.session.commit()
+                if stage == 'COMPLETED':
+                    break
+                if stage in ('FAILED', 'SUSPENDED'):
+                    raise RuntimeError(f'Galaxy dating job {stage.lower()}: {(msg or "")[:400]}')
+                time.sleep(15)
+            else:
+                raise RuntimeError('Timed out waiting for Galaxy IQ-TREE/LSD2 (3h).')
+
+            dest_dir = os.path.join(job.result_dir, 'dating')
+            pipeline.galaxy_download_results(galaxy_key, gjob, dest_dir)
+            timetree_path, report_path = pipeline.find_dating_outputs(dest_dir)
+            if not timetree_path:
+                raise RuntimeError('IQ-TREE/LSD2 finished but produced no readable dated-tree output.')
+            job.dating_newick = pipeline.parse_timetree_newick(timetree_path)
+            if report_path:
+                with open(report_path, errors='ignore') as fh:
+                    job.dating_report = fh.read()[:20000]
+            job.dating_status = 'ready'
+            job.dating_message = 'Divergence-time estimate ready.'
+        except Exception as exc:
+            job.dating_status = 'error'
+            job.dating_message = str(exc)
+        db.session.commit()
+
+
 # ── Detail / status / reroot / download / delete ────────────────────────────
 
 @jobs_bp.route('/job/<job_id>')
@@ -535,6 +643,14 @@ def download_zip(job_id):
             readme.append('species -> fragments included in the concatenated tree:')
             for sp, cov in sorted(job.species_coverage.items()):
                 readme.append(f'  {sp}: {cov}')
+        if job.calibrations:
+            readme.append('')
+            readme.append('divergence-dating calibration points (IQ-TREE/LSD2, millions of years before present):')
+            for cal in job.calibrations:
+                taxa = ', '.join(cal.get('taxa') or [])
+                readme.append(f"  {taxa}: min={cal.get('min_age')} max={cal.get('max_age')}")
+            if job.dating_status:
+                readme.append(f'dating status: {job.dating_status} — {job.dating_message or ""}')
         zf.writestr('README.txt', '\n'.join(readme) + '\n')
 
         for code, info in fragment_files.items():
@@ -552,6 +668,13 @@ def download_zip(job_id):
             zf.writestr('ml_tree_raxmlng.nwk', job.ml_newick)
         if job.ml_rooted_newick:
             zf.writestr('ml_tree_raxmlng_rooted.nwk', job.ml_rooted_newick)
+        if job.dating_newick:
+            zf.writestr('dating_timetree.nwk', job.dating_newick)
+        if job.dating_report:
+            zf.writestr('dating_lsd2_report.txt', job.dating_report)
+        cal_path = os.path.join(job.result_dir, 'dating_calibrations.txt')
+        if os.path.exists(cal_path):
+            zf.write(cal_path, 'dating_calibrations.txt')
     buf.seek(0)
     return send_file(buf, mimetype='application/zip', as_attachment=True,
                       download_name=f'phylogen_{job.id[:8]}.zip')

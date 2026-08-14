@@ -907,3 +907,176 @@ def find_best_tree(results_dir):
                     if os.path.isfile(path) and _looks_like_newick(path):
                         return path, key in _TREE_NAMES_WITH_SUPPORT
     return None, False
+
+
+# ── Divergence-time dating (IQ-TREE + LSD2 on Galaxy) ─────────────────────────
+# LSD2 (least-squares dating) is bundled into IQ-TREE and hosted on
+# usegalaxy.eu as toolshed.g2.bx.psu.edu/repos/iuc/iqtree/iqtree. Verified
+# parameter wiring (fetched live from the Galaxy tool model, not guessed):
+#   s                       = alignment dataset
+#   t  + n=0                = starting tree + zero search iterations, the
+#                             closest equivalent this wrapper exposes to
+#                             IQ-TREE's own '-te' (fix topology, don't search)
+#   m                       = substitution model string
+#   o                       = outgroup taxa (comma-separated), for rooting
+#   date_source|select_source = 'dataset', date_source|date = calibration file
+#   date_ci, clock_sd       = LSD2 confidence-interval and relaxed-clock knobs
+# v1 limitation: one model string is used for the whole (possibly
+# concatenated) alignment during dating -- the RAxML-NG step still properly
+# partitions per fragment, but LSD2's own topology/rate re-optimization here
+# does not; stated plainly in the UI rather than silently approximated.
+
+IQTREE_TOOL_ID = 'toolshed.g2.bx.psu.edu/repos/iuc/iqtree/iqtree/3.1.3+galaxy0'
+
+
+def _match_tip_name(tip_names, query):
+    """Case-insensitive substring match (either direction) of `query` against
+    tip_names (each normalized: '_' -> ' '). Returns the matching raw tip name,
+    or None."""
+    q = (query or '').strip().lower()
+    if not q:
+        return None
+    for t in tip_names:
+        norm = t.lower().replace('_', ' ')
+        if q in norm or norm in q:
+            return t
+    return None
+
+
+def newick_tip_names(newick):
+    from Bio import Phylo
+    from io import StringIO
+    tree = Phylo.read(StringIO(newick), 'newick')
+    return [t.name for t in tree.get_terminals() if t.name]
+
+
+def _fmt_past_age(age_mya):
+    """Format a positive Mya value as an LSD2 past-time number: 0 stays '0'
+    (avoids a cosmetic '-0.0'), everything else becomes negative."""
+    v = abs(float(age_mya))
+    return '0' if v == 0 else f'-{v}'
+
+
+def build_calibration_file(calibrations, tip_names, out_path):
+    """calibrations: list of {'taxa': [species name, ...], 'min_age': float|None,
+    'max_age': float|None} (millions of years before present). Writes an LSD2
+    ancestral-date file: 'tipA,tipB<TAB><lower>:<upper>' on the LSD2 numeric
+    time axis (0 = present, more negative = further in the past; the more
+    negative bound is written first, matching LSD2's documented ascending-
+    order convention). Returns (path_or_None, matched_rows, unmatched_names)."""
+    lines, matched_rows, unmatched = [], [], []
+    for cal in calibrations or []:
+        taxa_in, min_age, max_age = cal.get('taxa') or [], cal.get('min_age'), cal.get('max_age')
+        if min_age is None and max_age is None:
+            continue
+        matched_taxa = []
+        for name in taxa_in:
+            tip = _match_tip_name(tip_names, name)
+            if tip:
+                matched_taxa.append(tip)
+            else:
+                unmatched.append(name)
+        if not matched_taxa:
+            continue
+        if min_age is not None and max_age is not None and float(min_age) == float(max_age):
+            date_field = _fmt_past_age(min_age)
+        else:
+            lo = _fmt_past_age(max_age) if max_age is not None else 'NA'
+            hi = _fmt_past_age(min_age) if min_age is not None else 'NA'
+            date_field = f'{lo}:{hi}'
+        lines.append(f"{','.join(matched_taxa)}\t{date_field}")
+        matched_rows.append({'taxa': matched_taxa, 'min_age': min_age, 'max_age': max_age})
+    if not lines:
+        return None, [], unmatched
+    with open(out_path, 'w') as fh:
+        fh.write('\n'.join(lines) + '\n')
+    return out_path, matched_rows, unmatched
+
+
+def submit_dating(concat_path, ml_tree_newick, date_file_path, api_key,
+                   model='GTR+G', outgroup_names=None, date_ci=100, clock_sd=0.2):
+    """Submit an IQ-TREE + LSD2 divergence-dating run on Galaxy. Returns
+    (history_id, galaxy_job_id)."""
+    history_id = galaxy_create_history(api_key, 'phylogen_Dating')
+
+    aln_ds, up_job = galaxy_upload_file(api_key, history_id, concat_path, 'fasta')
+    if up_job:
+        state = galaxy_wait_for_job(api_key, up_job, max_wait=300)
+        if state != 'ok':
+            raise RuntimeError(f'Galaxy alignment upload failed (state: {state})')
+
+    tree_path = concat_path + '.dating_input_tree.nwk'
+    with open(tree_path, 'w') as fh:
+        fh.write(ml_tree_newick.strip() + '\n')
+    tree_ds, tree_job = galaxy_upload_file(api_key, history_id, tree_path, 'nhx')
+    if tree_job:
+        state = galaxy_wait_for_job(api_key, tree_job, max_wait=300)
+        if state != 'ok':
+            raise RuntimeError(f'Galaxy tree upload failed (state: {state})')
+
+    date_ds, date_job = galaxy_upload_file(api_key, history_id, date_file_path, 'txt')
+    if date_job:
+        state = galaxy_wait_for_job(api_key, date_job, max_wait=300)
+        if state != 'ok':
+            raise RuntimeError(f'Galaxy date-file upload failed (state: {state})')
+
+    inputs = {
+        's': {'src': 'hda', 'id': aln_ds},
+        't': {'src': 'hda', 'id': tree_ds},
+        'n': 0,
+        'm': model or 'GTR+G',
+        'date_source|select_source': 'dataset',
+        'date_source|date': {'src': 'hda', 'id': date_ds},
+        'date_ci': int(date_ci),
+        'clock_sd': float(clock_sd),
+    }
+    if outgroup_names:
+        inputs['o'] = ','.join(outgroup_names)
+
+    job_id = galaxy_run_tool(api_key, history_id, IQTREE_TOOL_ID, inputs)
+    return history_id, job_id
+
+
+def find_dating_outputs(results_dir):
+    """Locate the LSD2 dated-tree (NEXUS) and text report among a downloaded
+    IQ-TREE dating job's outputs. Matches by normalized substring against the
+    tool's declared output labels ('Tree labeled with dates', 'LSD Report')
+    rather than exact filenames, which vary with Galaxy dataset numbering.
+    Returns (timetree_path_or_None, report_path_or_None)."""
+    try:
+        names = os.listdir(results_dir)
+    except OSError:
+        return None, None
+    timetree = report = None
+    for name in names:
+        n = re.sub(r'[^a-z0-9]', '', name.lower())
+        path = os.path.join(results_dir, name)
+        if not os.path.isfile(path):
+            continue
+        if 'labeledwithdates' in n or 'timetree' in n:
+            timetree = path
+        elif 'lsdreport' in n:
+            report = path
+    return timetree, report
+
+
+def parse_timetree_newick(nexus_or_newick_path):
+    """Read the LSD2 dated-tree output (NEXUS, node labels = ages) and return a
+    plain Newick string with time-scaled branch lengths and tip labels intact,
+    but internal node labels stripped. Keeping them would make the shared tree
+    renderer misread ages as bootstrap-support percentages and color-code them
+    accordingly, which would be actively misleading."""
+    from Bio import Phylo
+    import io
+    try:
+        tree = Phylo.read(nexus_or_newick_path, 'nexus')
+    except Exception:
+        tree = Phylo.read(nexus_or_newick_path, 'newick')
+    for clade in tree.find_clades():
+        clade.comment = None
+        if not clade.is_terminal():
+            clade.name = None
+            clade.confidence = None
+    buf = io.StringIO()
+    Phylo.write(tree, buf, 'newick')
+    return buf.getvalue().strip()
