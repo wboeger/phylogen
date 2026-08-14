@@ -231,11 +231,34 @@ def _run_fetch(job, creds):
 
 # ── Stage 2: user approves -> align + trim + concatenate + NJ ───────────────
 
+def _all_found_accessions(job):
+    accs = set()
+    for frag_result in (job.fetch_results or {}).values():
+        for row in frag_result.get('found', []):
+            accs.add(row['accession'])
+    return accs
+
+
 @jobs_bp.route('/api/job/<job_id>/approve_and_align', methods=['POST'])
 def approve_and_align(job_id):
     job = db.session.get(Job, job_id) or abort(404)
     if job.status != 'fetched':
         return jsonify({'error': f'Job is not awaiting approval (status: {job.status}).'}), 400
+
+    rejected_raw = request.form.get('rejected_accessions', '')
+    rejected = sorted({a.strip() for a in rejected_raw.split(',') if a.strip()})
+    all_found = _all_found_accessions(job)
+    approved_count = len(all_found - set(rejected))
+
+    if all_found and approved_count == 0:
+        # Every fetched sequence was rejected -- nothing to align. Abandon the
+        # job rather than run a pipeline on zero sequences.
+        result_dir = job.result_dir
+        db.session.delete(job)
+        db.session.commit()
+        secret_cache.forget(job_id)
+        shutil.rmtree(result_dir, ignore_errors=True)
+        return jsonify({'status': 'rejected_all', 'redirect': url_for('main.index')})
 
     creds = secret_cache.get(job_id) or {}
     galaxy_api_key = (request.form.get('galaxy_api_key') or '').strip() or creds.get('galaxy_api_key')
@@ -243,8 +266,10 @@ def approve_and_align(job_id):
         return jsonify({'error': 'A usegalaxy.eu API key is required to align/trim.'}), 400
     secret_cache.put(job_id, **{**creds, 'galaxy_api_key': galaxy_api_key})
 
+    job.rejected_accessions = rejected
     job.status = 'aligning'
-    job.status_message = 'Approved. Aligning fragment(s) on Galaxy…'
+    job.status_message = ('Approved. Aligning fragment(s) on Galaxy…' if not rejected else
+                           f'Approved ({len(rejected)} sequence(s) excluded). Aligning fragment(s) on Galaxy…')
     db.session.commit()
 
     app_obj = current_app._get_current_object()
@@ -274,12 +299,19 @@ def _run_align_concat_nj(job, galaxy_key):
         db.session.commit()
 
     fragment_files = dict(job.fragment_files or {})
+    rejected = job.rejected_accessions or []
     frag_paths = []
     for frag in job.fragments:
         code = frag['code']
         raw_path = fragment_files.get(code, {}).get('raw')
+        if raw_path and rejected:
+            approved_path = os.path.join(job.result_dir, f'{code}_raw_approved.fasta')
+            removed = pipeline.filter_fasta_exclude(raw_path, rejected, approved_path)
+            if removed:
+                progress(f'[{code}] Excluded {len(removed)} rejected sequence(s).')
+            raw_path = approved_path
         if not raw_path or pipeline.count_fasta(raw_path) < 2:
-            progress(f'[{code}] Skipped — fewer than 2 sequences were fetched for this fragment.')
+            progress(f'[{code}] Skipped — fewer than 2 approved sequences for this fragment.')
             continue
 
         progress(f'[{code}] Aligning on Galaxy (MAFFT)…')
@@ -486,6 +518,8 @@ def download_zip(job_id):
             readme.append(f'taxon: {job.taxon_query} (max {job.taxon_max_species} species)')
         if job.outgroup_text:
             readme.append(f'outgroup: {job.outgroup_text}')
+        if job.rejected_accessions:
+            readme.append(f'user-rejected accessions (excluded from alignment): {", ".join(job.rejected_accessions)}')
         readme.append('')
         readme.append('fragments:')
         for frag in job.fragments:

@@ -37,7 +37,11 @@
 
 <div class="card on-canvas" id="review-card" style="{{ '' if job.status == 'fetched' else 'display:none;' }}">
   <h3>Review fetched sequences</h3>
-  <p class="hint">Check what was found per fragment before spending Galaxy time aligning it.</p>
+  <p class="hint">Check what was found per fragment before spending Galaxy time aligning it. Uncheck any sequence you don't want included.</p>
+  <label class="fragment-check" style="margin-bottom:6px;">
+    <input type="checkbox" id="select-all-seqs" checked onchange="toggleAllSeqs(this.checked)">
+    <span><strong>Approve all sequences</strong> <span id="approve-count-hint" class="hint" style="display:inline;"></span></span>
+  </label>
   <div id="review-body"></div>
   <form onsubmit="return submitApprove(event)" style="margin-top:16px; display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap;">
     <div class="field" style="flex:1; min-width:260px; margin:0;">
@@ -109,6 +113,7 @@ let polling = null;
 let mainTimerHandle = null;
 let mlTimerHandle = null;
 let lastData = null;
+let reviewRendered = false;
 
 function renderIfPresent(id, newick) {
   if (!newick) return;
@@ -179,18 +184,38 @@ function renderReview(fetchResults) {
   for (const [code, r] of Object.entries(fetchResults)) {
     html += `<h4 style="margin:14px 0 4px;">${escapeHtml(code)} <span class="hint" style="font-weight:400;">(${r.n_sequences} sequence(s))</span></h4>`;
     if (r.found && r.found.length) {
-      html += '<table class="review-table"><thead><tr><th>Species</th><th>Accession</th><th>Length</th></tr></thead><tbody>';
+      html += '<table class="review-table"><thead><tr><th></th><th>Species</th><th>Accession</th><th>Length</th></tr></thead><tbody>';
       for (const row of r.found) {
-        html += `<tr><td><em>${escapeHtml(row.species)}</em></td><td class="mono">${escapeHtml(row.accession)}</td><td>${row.length} bp</td></tr>`;
+        html += `<tr><td><input type="checkbox" class="seq-approve" data-accession="${escapeHtml(row.accession)}" checked onchange="updateApproveCount()"></td>` +
+                `<td><em>${escapeHtml(row.species)}</em></td><td class="mono">${escapeHtml(row.accession)}</td><td>${row.length} bp</td></tr>`;
       }
       html += '</tbody></table>';
     }
     const missing = (r.missing || []).concat(r.outgroup_missing || []);
     if (missing.length) {
-      html += `<table class="review-table"><tbody><tr class="missing-row"><td>Not found:</td><td colspan="2">${escapeHtml(missing.join(', '))}</td></tr></tbody></table>`;
+      html += `<table class="review-table"><tbody><tr class="missing-row"><td colspan="2">Not found:</td><td colspan="2">${escapeHtml(missing.join(', '))}</td></tr></tbody></table>`;
     }
   }
   body.innerHTML = html;
+  updateApproveCount();
+}
+
+function toggleAllSeqs(checked) {
+  document.querySelectorAll('.seq-approve').forEach(cb => { cb.checked = checked; });
+  updateApproveCount();
+}
+
+function updateApproveCount() {
+  const boxes = document.querySelectorAll('.seq-approve');
+  const total = boxes.length;
+  const approved = document.querySelectorAll('.seq-approve:checked').length;
+  const hint = document.getElementById('approve-count-hint');
+  const master = document.getElementById('select-all-seqs');
+  if (hint) hint.textContent = total ? `(${approved} of ${total} selected)` : '';
+  if (master) {
+    master.checked = approved === total;
+    master.indeterminate = approved > 0 && approved < total;
+  }
 }
 
 function renderConfirm(coverage) {
@@ -233,7 +258,7 @@ function applyStatus(data) {
   renderFragmentModels(data.fragment_models, data.fragment_counts);
 
   document.getElementById('review-card').style.display = (data.status === 'fetched') ? '' : 'none';
-  if (data.status === 'fetched') renderReview(data.fetch_results);
+  if (data.status === 'fetched' && !reviewRendered) { renderReview(data.fetch_results); reviewRendered = true; }
 
   if (data.nj_newick) {
     document.getElementById('nj-card').style.display = '';
@@ -290,12 +315,23 @@ polling = setInterval(pollStatus, 3000);
 async function submitApprove(evt) {
   evt.preventDefault();
   const key = document.getElementById('approve-galaxy-key').value.trim();
+  const rejected = Array.from(document.querySelectorAll('.seq-approve:not(:checked)'))
+    .map(cb => cb.dataset.accession);
+  const total = document.querySelectorAll('.seq-approve').length;
+  if (total && rejected.length === total) {
+    if (!confirm('You unchecked every sequence — this job will be abandoned. Continue?')) return false;
+  }
   const btn = evt.target.querySelector('button[type=submit]');
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Approving…';
   const fd = new FormData();
   if (key) fd.append('galaxy_api_key', key);
+  fd.append('rejected_accessions', rejected.join(','));
   const resp = await fetch(`/api/job/${JOB_ID}/approve_and_align`, {method: 'POST', body: fd});
   const data = await resp.json();
+  if (data.status === 'rejected_all') {
+    window.location.href = data.redirect;
+    return false;
+  }
   if (data.error) { alert(data.error); btn.disabled = false; btn.textContent = 'Approve & align'; return false; }
   document.getElementById('review-card').style.display = 'none';
   if (!polling) polling = setInterval(pollStatus, 3000);

@@ -64,6 +64,9 @@ class Job(db.Model):
     # Per-fragment fetch review: {code: {found:[{species,accession,length}],
     # missing:[...], outgroup_missing:[...], n_sequences}}
     fetch_results = db.Column(db.JSON)
+    # Accession numbers the user unchecked on the review screen (excluded
+    # from alignment even though they were fetched); see approve_and_align.
+    rejected_accessions = db.Column(db.JSON)
     n_sequences = db.Column(db.Integer)
 
     # Per-fragment files + estimated model + post-align sequence count:

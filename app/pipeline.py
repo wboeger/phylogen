@@ -232,6 +232,29 @@ def summarize_fetch(records):
     return found
 
 
+def filter_fasta_exclude(input_path, exclude_accessions, output_path):
+    """Rewrite input_path to output_path, dropping any record whose header
+    contains one of exclude_accessions (user-rejected sequences from the
+    review screen). Returns the list of removed header lines."""
+    exclude = {a.strip() for a in (exclude_accessions or []) if a.strip()}
+    if not exclude:
+        import shutil
+        shutil.copyfile(input_path, output_path)
+        return []
+    removed, skip, buf = [], False, []
+    with open(input_path) as fin:
+        for line in fin:
+            if line.startswith('>'):
+                skip = any(acc in line for acc in exclude)
+                if skip:
+                    removed.append(line.strip())
+            if not skip:
+                buf.append(line)
+    with open(output_path, 'w') as fout:
+        fout.writelines(buf)
+    return removed
+
+
 def write_fasta(records, path):
     from Bio import SeqIO
     with open(path, 'w') as fh:
