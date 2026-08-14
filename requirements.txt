@@ -1,0 +1,5 @@
+Flask>=3.0
+Flask-SQLAlchemy>=3.1
+requests>=2.31
+gunicorn>=21.2
+biopython>=1.83   # Bio.Entrez / Bio.SeqIO / Bio.Phylo — NCBI fetch, NJ tree, rerooting

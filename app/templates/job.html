@@ -1,0 +1,170 @@
+{% extends 'base.html' %}
+{% block title %}phylogen — job {{ job.id[:8] }}{% endblock %}
+{% block content %}
+
+<a href="{{ url_for('main.index') }}" style="font-size:0.85rem;">&larr; back to phylogen</a>
+
+<div class="card on-canvas" style="margin-top:16px;">
+  <div class="status-line">
+    <h2 style="margin:0;">
+      {% if job.input_mode == 'taxon' %}{{ job.taxon_query }}{% else %}Manual species list{% endif %}
+      &mdash; {{ job.marker }}
+    </h2>
+    <span class="badge status-{{ job.status }}" id="status-badge">{{ job.status.replace('_', ' ') }}</span>
+  </div>
+  <p class="status-message" id="status-message">{{ job.status_message or '' }}</p>
+
+  <ul class="file-list mono" style="font-size:0.8rem; color: var(--muted);">
+    <li>job id: {{ job.id }}</li>
+    <li>NCBI query: {{ job.gene_query }}</li>
+    <li>min length: {{ job.min_length }} bp</li>
+    {% if job.outgroup_text %}<li>outgroup: {{ job.outgroup_text.replace('\n', ', ') }}</li>{% endif %}
+  </ul>
+
+  <div style="margin-top:16px; display:flex; gap:10px; flex-wrap:wrap;">
+    <a class="btn btn-secondary" href="{{ url_for('jobs.download_zip', job_id=job.id) }}">Download results (.zip)</a>
+    {% if is_owner %}
+    <button class="btn-danger" onclick="deleteJob()">Delete job</button>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card on-canvas" id="nj-card" style="{{ '' if job.nj_newick else 'display:none;' }}">
+  <h3>Neighbor-Joining preview tree</h3>
+  <p class="hint" id="nj-note">{{ job.nj_root_note or '' }}</p>
+  <div class="tree-panel"><svg id="nj-svg"></svg></div>
+  <form onsubmit="return doReroot(event, 'nj')" style="margin-top:16px; display:flex; gap:10px; align-items:flex-end;">
+    <div class="field" style="flex:1; margin:0;">
+      <label>Re-root on (species names, comma or newline separated)</label>
+      <input type="text" id="nj-reroot-names" placeholder="e.g. Outgroup species name">
+    </div>
+    <button type="submit" class="btn-secondary">Re-root</button>
+  </form>
+</div>
+
+<div class="card on-canvas" id="ml-card" style="{{ '' if job.ml_status else 'display:none;' }}">
+  <h3>Maximum-Likelihood tree (RAxML-NG, bootstrap support)</h3>
+  <p class="status-message" id="ml-message">{{ job.ml_message or '' }}</p>
+  <div class="tree-panel" id="ml-tree-panel" style="{{ '' if job.ml_newick else 'display:none;' }}">
+    <svg id="ml-svg"></svg>
+  </div>
+  <form onsubmit="return doReroot(event, 'ml')" id="ml-reroot-form" style="margin-top:16px; display:{{ 'flex' if job.ml_newick else 'none' }}; gap:10px; align-items:flex-end;">
+    <div class="field" style="flex:1; margin:0;">
+      <label>Re-root on (species names, comma or newline separated)</label>
+      <input type="text" id="ml-reroot-names" placeholder="e.g. Outgroup species name">
+    </div>
+    <button type="submit" class="btn-secondary">Re-root</button>
+  </form>
+</div>
+
+<div class="card on-canvas" id="build-ml-card" style="{{ 'display:none;' if job.ml_status else '' }}">
+  <h3>Build a bootstrapped ML tree</h3>
+  <p>Submits the trimmed alignment to usegalaxy.eu for a RAxML-NG run (ML search + bootstrap support). This can take from minutes to a few hours depending on alignment size and Galaxy queue load.</p>
+  <form onsubmit="return submitBuildMl(event)" style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap;" id="build-ml-form">
+    <div class="field" style="flex:1; min-width:260px; margin:0;">
+      <label for="ml-galaxy-key">usegalaxy.eu API key</label>
+      <input type="password" id="ml-galaxy-key" placeholder="re-enter your Galaxy API key" autocomplete="off">
+    </div>
+    <button type="submit" class="btn-primary" {{ 'disabled' if not job.trimmed_fasta_path }}>Build ML tree</button>
+  </form>
+  {% if not job.trimmed_fasta_path %}<p class="hint">Waiting for alignment/trimming to finish first.</p>{% endif %}
+</div>
+
+<script src="{{ url_for('static', filename='js/tree.js') }}"></script>
+<script>
+const JOB_ID = {{ job.id | tojson }};
+let polling = null;
+
+function renderIfPresent(id, newick) {
+  if (!newick) return;
+  const svg = document.getElementById(id);
+  requestAnimationFrame(() => renderPhylogram(newick, svg));
+}
+
+function applyStatus(data) {
+  document.getElementById('status-badge').textContent = data.status.replace('_', ' ');
+  document.getElementById('status-badge').className = 'badge status-' + data.status;
+  document.getElementById('status-message').textContent = data.status_message || data.error_message || '';
+
+  if (data.nj_newick) {
+    document.getElementById('nj-card').style.display = '';
+    document.getElementById('nj-note').textContent = data.nj_root_note || '';
+    renderIfPresent('nj-svg', data.nj_newick);
+  }
+
+  if (data.ml_status) {
+    document.getElementById('ml-card').style.display = '';
+    document.getElementById('build-ml-card').style.display = 'none';
+    document.getElementById('ml-message').textContent = data.ml_message || '';
+    if (data.ml_newick) {
+      document.getElementById('ml-tree-panel').style.display = '';
+      document.getElementById('ml-reroot-form').style.display = 'flex';
+      renderIfPresent('ml-svg', data.ml_newick);
+    }
+  }
+
+  const stillRunning = ['created', 'fetching', 'aligning', 'nj_running'].includes(data.status)
+                        || data.ml_status === 'running';
+  if (!stillRunning && polling) { clearInterval(polling); polling = null; }
+}
+
+async function pollStatus() {
+  try {
+    const resp = await fetch(`/api/job/${JOB_ID}/status`);
+    const data = await resp.json();
+    applyStatus(data);
+  } catch (e) { /* transient network error — keep polling */ }
+}
+
+// Render whatever the server already rendered, then poll if still in-flight.
+applyStatus({{ job.to_status_dict() | tojson }});
+{% if job.status in ('created', 'fetching', 'aligning', 'nj_running') or job.ml_status == 'running' %}
+polling = setInterval(pollStatus, 3000);
+{% endif %}
+
+async function doReroot(evt, which) {
+  evt.preventDefault();
+  const input = document.getElementById(which + '-reroot-names');
+  const resp = await fetch(`/api/job/${JOB_ID}/reroot`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({tree: which, names: input.value}),
+  });
+  const data = await resp.json();
+  if (data.error) { alert(data.error); return false; }
+  if (which === 'nj') {
+    document.getElementById('nj-note').textContent = data.note;
+    renderIfPresent('nj-svg', data.newick);
+  } else {
+    renderIfPresent('ml-svg', data.newick);
+  }
+  return false;
+}
+
+async function submitBuildMl(evt) {
+  evt.preventDefault();
+  const key = document.getElementById('ml-galaxy-key').value.trim();
+  if (!key) { alert('Enter your usegalaxy.eu API key.'); return false; }
+  const btn = evt.target.querySelector('button[type=submit]');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…';
+  const fd = new FormData();
+  fd.append('galaxy_api_key', key);
+  const resp = await fetch(`/api/job/${JOB_ID}/build_ml`, {method: 'POST', body: fd});
+  const data = await resp.json();
+  if (data.error) { alert(data.error); btn.disabled = false; btn.textContent = 'Build ML tree'; return false; }
+  document.getElementById('build-ml-card').style.display = 'none';
+  document.getElementById('ml-card').style.display = '';
+  document.getElementById('ml-message').textContent = data.message || 'Running…';
+  if (!polling) polling = setInterval(pollStatus, 3000);
+  return false;
+}
+
+async function deleteJob() {
+  if (!confirm('Delete this job and all its files? This cannot be undone.')) return;
+  const resp = await fetch(`/api/job/${JOB_ID}/delete`, {method: 'POST'});
+  const data = await resp.json();
+  if (data.error) { alert(data.error); return; }
+  window.location.href = '{{ url_for("main.index") }}';
+}
+</script>
+{% endblock %}

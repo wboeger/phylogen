@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}phylogen — build a phylogenetic tree{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <nav class="topnav">
+    <div class="container">
+      <a class="brand" href="{{ url_for('main.index') }}"><span class="mark"></span>phylogen</a>
+      <a class="nav-link" href="https://usegalaxy.eu" target="_blank" rel="noopener">usegalaxy.eu &#8599;</a>
+    </div>
+  </nav>
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+  <footer>
+    phylogen — NCBI sequence fetch, MAFFT/trimAl alignment, NJ &amp; RAxML-NG trees, on your own credentials.
+  </footer>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

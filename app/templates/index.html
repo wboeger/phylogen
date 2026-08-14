@@ -1,0 +1,164 @@
+{% extends 'base.html' %}
+{% block content %}
+
+<section class="hero">
+  <span class="eyebrow">Free &amp; open · any taxon</span>
+  <h1 class="display">Build a phylogenetic tree from any species list.</h1>
+  <p class="lede">
+    phylogen fetches sequences from GenBank, aligns them (MAFFT), trims the
+    alignment (trimAl), and gives you an instant Neighbor-Joining preview tree —
+    with an optional bootstrapped Maximum-Likelihood tree (RAxML-NG) on request.
+    Works for animals, plants, fungi, bacteria — any group NCBI has sequence data for.
+  </p>
+</section>
+
+<div class="notice">
+  <h3>Before you start — you'll need two free API keys</h3>
+  <ul>
+    <li><strong>An NCBI contact email</strong> (and optionally a free
+      <a href="https://www.ncbi.nlm.nih.gov/account/settings/" target="_blank" rel="noopener">NCBI API key</a>,
+      which raises the fetch rate limit). NCBI requires an email on every Entrez request; this is <em>not</em> a login.</li>
+    <li><strong>A free <a href="https://usegalaxy.eu/" target="_blank" rel="noopener">usegalaxy.eu</a> account API key</strong>
+      (Galaxy → User → Preferences → Manage API Key) — alignment, trimming, and the optional ML tree run as jobs on your Galaxy account.</li>
+  </ul>
+  <p style="margin: 12px 0 0; font-size: 0.85rem; color: var(--muted);">
+    Nothing you enter is stored on this server or in a database — your keys are held in memory only for
+    as long as your job's pipeline needs them, then discarded. There is no login for this site; a
+    browser cookie just remembers which jobs are yours so they show up below.
+  </p>
+</div>
+
+{% if errors %}
+<div class="errors">
+  <strong>Fix the following and resubmit:</strong>
+  <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+
+<div class="card on-canvas">
+  <h2>New tree</h2>
+  <form method="POST" action="{{ url_for('jobs.create_job') }}" id="new-job-form">
+
+    <fieldset>
+      <legend>Species</legend>
+      <div class="radio-row">
+        <label><input type="radio" name="input_mode" value="manual" checked onchange="setMode('manual')"> Manual species list</label>
+        <label><input type="radio" name="input_mode" value="taxon" onchange="setMode('taxon')"> Discover from a higher taxon</label>
+      </div>
+
+      <div id="panel-manual" class="mode-panel active">
+        <div class="field">
+          <label for="species_text">Species, one per line</label>
+          <textarea name="species_text" id="species_text" placeholder="Homo sapiens&#10;Pan troglodytes&#10;Gorilla gorilla">{{ form.species_text if form else '' }}</textarea>
+          <div class="hint">At least 2 species. Each is searched on NCBI individually for the chosen marker.</div>
+        </div>
+      </div>
+
+      <div id="panel-taxon" class="mode-panel">
+        <div class="field">
+          <label for="taxon_query">Higher taxon (genus, family, order…)</label>
+          <input type="text" name="taxon_query" id="taxon_query" placeholder="e.g. Salmonidae" value="{{ form.taxon_query if form else '' }}">
+          <div class="hint">Searches NCBI for every descendant species with a hit for the chosen marker.</div>
+        </div>
+        <div class="field">
+          <label for="taxon_max_species">Max species to include</label>
+          <input type="number" name="taxon_max_species" id="taxon_max_species" value="{{ form.taxon_max_species if form else 40 }}" min="3" max="150">
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Marker / gene</legend>
+      <div class="field">
+        <label for="marker">Marker</label>
+        <select name="marker" id="marker" onchange="onMarkerChange()">
+          {% for code, info in markers.items() %}
+          <option value="{{ code }}" data-query="{{ info.query }}" data-minlen="{{ info.min_length }}">{{ code }} — {{ info.label }}</option>
+          {% endfor %}
+          <option value="custom">Custom NCBI query…</option>
+        </select>
+      </div>
+      <div class="field" id="custom-query-field" style="display:none;">
+        <label for="custom_query">Custom NCBI nuccore search term</label>
+        <textarea name="custom_query" id="custom_query" placeholder='e.g. rpoB[Gene] AND 500:3000[SLEN]'>{{ form.custom_query if form else '' }}</textarea>
+      </div>
+      <div class="field">
+        <label for="min_length">Minimum sequence length (bp)</label>
+        <input type="number" name="min_length" id="min_length" value="{{ form.min_length if form else 400 }}" min="1">
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Outgroup (optional)</legend>
+      <div class="field">
+        <label for="outgroup_text">Outgroup species, one per line</label>
+        <textarea name="outgroup_text" id="outgroup_text" placeholder="Leave blank for an unrooted / midpoint-rooted tree">{{ form.outgroup_text if form else '' }}</textarea>
+        <div class="hint">If given, the tree is rooted on the MRCA of these tips.</div>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Your credentials (used, never stored)</legend>
+      <div class="field">
+        <label for="ncbi_email">NCBI contact email</label>
+        <input type="email" name="ncbi_email" id="ncbi_email" required placeholder="you@example.com" value="{{ form.ncbi_email if form else '' }}">
+      </div>
+      <div class="field">
+        <label for="ncbi_api_key">NCBI API key (optional, raises rate limit)</label>
+        <input type="password" name="ncbi_api_key" id="ncbi_api_key" autocomplete="off" placeholder="optional">
+      </div>
+      <div class="field">
+        <label for="galaxy_api_key">usegalaxy.eu API key</label>
+        <input type="password" name="galaxy_api_key" id="galaxy_api_key" required autocomplete="off" placeholder="required for align/trim">
+      </div>
+    </fieldset>
+
+    <button type="submit" class="btn-primary">Build tree</button>
+  </form>
+</div>
+
+{% if jobs %}
+<div class="card on-canvas">
+  <h2>Your recent jobs</h2>
+  {% for job in jobs %}
+  <div class="job-row">
+    <div>
+      <div class="title"><a href="{{ url_for('jobs.job_detail', job_id=job.id) }}">
+        {{ job.taxon_query or (job.species_found and (job.species_found|length) ~ ' species') or (job.species_text or '').splitlines()|length ~ ' species requested' }}
+        — {{ job.marker }}</a></div>
+      <div class="meta">{{ job.created_at.strftime('%Y-%m-%d %H:%M') }} UTC</div>
+    </div>
+    <span class="badge status-{{ job.status }}">{{ job.status.replace('_', ' ') }}</span>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<script>
+const MARKERS = {};
+document.querySelectorAll('#marker option[data-query]').forEach(o => {
+  MARKERS[o.value] = {query: o.dataset.query, minlen: o.dataset.minlen};
+});
+
+function setMode(mode) {
+  document.getElementById('panel-manual').classList.toggle('active', mode === 'manual');
+  document.getElementById('panel-taxon').classList.toggle('active', mode === 'taxon');
+}
+
+function onMarkerChange() {
+  const sel = document.getElementById('marker');
+  const isCustom = sel.value === 'custom';
+  document.getElementById('custom-query-field').style.display = isCustom ? 'block' : 'none';
+  if (!isCustom && MARKERS[sel.value]) {
+    document.getElementById('min_length').value = MARKERS[sel.value].minlen;
+  }
+}
+onMarkerChange();
+
+document.getElementById('new-job-form').addEventListener('submit', function() {
+  const btn = this.querySelector('button[type=submit]');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Starting…';
+});
+</script>
+{% endblock %}
